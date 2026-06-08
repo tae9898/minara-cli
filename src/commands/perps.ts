@@ -941,7 +941,7 @@ const closeCmd = new Command('close')
           p: limitPx,
           s: sz,
           r: true,
-          t: { trigger: { triggerPx: String(marketPx), tpsl: 'tp', isMarket: true } },
+          t: { limit: { tif: 'Ioc' } },
         };
 
         try {
@@ -1052,7 +1052,7 @@ const closeCmd = new Command('close')
       p: limitPx,
       s: sz,
       r: true,
-      t: { trigger: { triggerPx: String(marketPx), tpsl: 'tp', isMarket: true } },
+      t: { limit: { tif: 'Ioc' } },
     };
 
     const sideLabel = isLong ? 'LONG' : 'SHORT';
