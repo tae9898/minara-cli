@@ -753,7 +753,7 @@ const orderCmd = new Command('order')
       r: reduceOnly,
       t: orderType === 'limit'
         ? { limit: { tif: 'Gtc' } }
-        : { trigger: { triggerPx: String(marketPx ?? limitPx), tpsl: opts.tpsl ?? 'tp', isMarket: true } },
+        : { limit: { tif: 'Ioc' } },
     };
 
     const priceLabel = orderType === 'market' ? `Market (~$${marketPx ?? limitPx})` : `$${limitPx}`;
