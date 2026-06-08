@@ -55,7 +55,7 @@ export function isRawJson(): boolean { return _rawJson; }
  * Keys matching this pattern are hidden from printKV / auto-detected table
  * columns. They are still included in --json raw output.
  */
-const HIDDEN_KEYS = /^_?id$|^_id$|^__v$/i;
+const HIDDEN_KEYS = /^_?id$|^_id$|^__v$|^raw_data$/i;
 
 // ─── Per-context key exclusions (non-regex, for specific commands) ───────
 
