@@ -137,12 +137,12 @@ export function formatValue(value: unknown, key?: string): string {
   if (typeof value === 'object') {
     // Shallow nested — show as inline key=value
     const entries = Object.entries(value as Record<string, unknown>).filter(
-      ([, v]) => v !== null && v !== undefined,
+      ([k, v]) => v !== null && v !== undefined && v !== '' && !HIDDEN_KEYS.test(k),
     );
     if (entries.length <= 3) {
-      return entries.map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`).join('  ');
+      return entries.map(([k, v]) => `${k}=${typeof v === 'string' ? v : formatValue(v, k)}`).join('  ');
     }
-    return chalk.dim(JSON.stringify(value));
+    return entries.map(([k, v]) => `${k}=${typeof v === 'string' ? v : formatValue(v, k)}`).join('  ');
   }
 
   return String(value);
@@ -301,9 +301,18 @@ export function printTxResult(data: unknown): void {
     return;
   }
 
-  const obj = data as Record<string, unknown>;
   console.log('');
-  printKV(obj);
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      if (typeof item === 'object' && item !== null) {
+        printKV(item as Record<string, unknown>);
+      } else {
+        console.log(chalk.dim(`  ${item}`));
+      }
+    }
+  } else {
+    printKV(data as Record<string, unknown>);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
