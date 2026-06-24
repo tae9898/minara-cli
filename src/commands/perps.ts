@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import { input, select, confirm, number as numberPrompt } from '@inquirer/prompts';
+import { input, select, confirm, number as numberPrompt, checkbox } from '@inquirer/prompts';
 import chalk from 'chalk';
 import * as perpsApi from '../api/perps.js';
 import { requireAuth } from '../config.js';
@@ -1074,6 +1074,288 @@ const closeCmd = new Command('close')
     assertApiOk(orderRes, 'Close position failed');
     success(`Position closed — ${sideLabel} ${symbol} ${sz}`);
     printTxResult(orderRes.data);
+  }));
+
+// ─── mirror (hedge) ──────────────────────────────────────────────────────
+
+interface MirrorOpts {
+  source?: string;
+  interval?: string;
+  dryRun?: boolean;
+  yes?: boolean;
+  wallet?: string;
+  leverage?: string;
+}
+
+const mirrorCmd = new Command('mirror')
+  .description('Monitor a wallet and auto-open opposite positions (hedge)')
+  .option('--source <addresses>', 'Source wallet(s) to monitor, comma-separated (0x… or wallet name)')
+  .option(WALLET_OPT[0], WALLET_OPT[1])
+  .option('-i, --interval <seconds>', 'Polling interval in seconds', '10')
+  .option('--leverage <n>', 'Target wallet leverage (fixed)', '40')
+  .option('--dry-run', 'Simulate without placing real orders')
+  .option('-y, --yes', 'Skip confirmation')
+  .action(wrapAction(async (opts: MirrorOpts) => {
+    const creds = requireAuth();
+
+    // Resolve target wallet
+    const target = await resolveWallet(creds.accessToken, opts.wallet, 'Select target (hedge) wallet:');
+    if (!target) return;
+    const { wallet, walletId } = target;
+
+    // Resolve source wallets (supports comma-separated)
+    interface SourceWallet {
+      key: string;           // unique identifier for dedup
+      address?: string;      // for external wallets (Hyperliquid public API)
+      subAccountId?: string; // for Minara sub-accounts (Minara API)
+      label: string;
+    }
+    const sources: SourceWallet[] = [];
+    const wallets = await fetchSubAccounts(creds.accessToken);
+
+    const resolveSourceInput = (inp: string): SourceWallet | null => {
+      const trimmed = inp.trim();
+      // External address
+      if (trimmed.startsWith('0x') && trimmed.length >= 42) {
+        return { key: trimmed, address: trimmed, label: `${trimmed.slice(0, 8)}…${trimmed.slice(-4)}` };
+      }
+      // Minara sub-account by name or ID
+      const match = wallets.find((w) =>
+        (w.name ?? '').toUpperCase() === trimmed.toUpperCase()
+        || getSubAccountId(w) === trimmed,
+      );
+      if (!match) return null;
+      const sid = getSubAccountId(match);
+      return {
+        key: sid || match.name || trimmed,
+        address: match.address,
+        subAccountId: sid || undefined,
+        label: match.name ?? sid ?? trimmed,
+      };
+    };
+
+    if (opts.source) {
+      const inputs = opts.source.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const inp of inputs) {
+        const src = resolveSourceInput(inp);
+        if (!src) {
+          warn(`Could not resolve source "${inp}".`);
+          return;
+        }
+        sources.push(src);
+      }
+    } else {
+      if (wallets.length > 0) {
+        const selected = await checkbox<string>({
+          message: 'Select source wallet(s) to monitor:',
+          choices: wallets.map((w) => ({
+            name: `${getSubAccountLabel(w)}`,
+            value: getSubAccountId(w),
+          })),
+        });
+        for (const sid of selected) {
+          const w = wallets.find((w) => getSubAccountId(w) === sid);
+          if (w) sources.push({
+            key: sid,
+            address: w.address,
+            subAccountId: sid,
+            label: w.name ?? sid,
+          });
+        }
+        if (sources.length === 0) {
+          const manualAddr = await input({
+            message: 'Source wallet address (0x…):',
+            validate: (v) => v.startsWith('0x') && v.length >= 42 ? true : 'Enter a valid EVM address',
+          });
+          sources.push({ key: manualAddr, address: manualAddr, label: `${manualAddr.slice(0, 8)}…${manualAddr.slice(-4)}` });
+        }
+      } else {
+        const manualAddr = await input({
+          message: 'Source wallet address (0x…):',
+          validate: (v) => v.startsWith('0x') && v.length >= 42 ? true : 'Enter a valid EVM address',
+        });
+        sources.push({ key: manualAddr, address: manualAddr, label: `${manualAddr.slice(0, 8)}…${manualAddr.slice(-4)}` });
+      }
+    }
+
+    if (sources.length === 0) {
+      warn('No source wallets selected.');
+      return;
+    }
+
+    const intervalSec = Math.max(3, parseInt(opts.interval ?? '10', 10) || 10);
+    const targetLeverage = Math.max(1, parseInt(opts.leverage ?? '40', 10) || 40);
+    const leverageSet = new Set<string>();
+
+    // Summary
+    console.log('');
+    console.log(chalk.bold('Mirror / Hedge Setup:'));
+    console.log(`  Sources (monitor):`);
+    for (const s of sources) {
+      const detail = s.address ? chalk.dim(s.address) : chalk.dim('(sub-account)');
+      console.log(`    ${chalk.yellow(s.label)}  ${detail}`);
+    }
+    console.log(`  Target (hedge)   : ${getSubAccountLabel(wallet)}`);
+    console.log(`  Interval         : ${intervalSec}s`);
+    console.log(`  Leverage         : ${chalk.cyan(`${targetLeverage}x (cross)`)}`);
+    console.log(`  Size matching    : ${chalk.dim('USD value')}`);
+    console.log(`  Mode             : ${opts.dryRun ? chalk.yellow('DRY RUN') : chalk.red('LIVE')}`);
+    console.log('');
+
+    if (!opts.yes) {
+      const ok = await confirm({ message: 'Start mirroring?', default: false });
+      if (!ok) return;
+    }
+    if (!opts.dryRun) await requireTouchId();
+
+    // ── Helper: fetch fills from a source (sub-account API or public API) ──
+    const fetchSourceFills = async (source: SourceWallet): Promise<Record<string, unknown>[]> => {
+      const startTime = Date.now() - 24 * 60 * 60 * 1000;
+      if (source.subAccountId) {
+        const res = await perpsApi.getSubAccountFills(creds.accessToken, source.subAccountId, startTime);
+        return res.success && Array.isArray(res.data) ? res.data as Record<string, unknown>[] : [];
+      }
+      if (source.address) {
+        return await perpsApi.getUserFills(source.address, 1) as unknown as Record<string, unknown>[];
+      }
+      return [];
+    };
+
+    // ── Baseline ──
+    const initSpin = spinner('Establishing baseline…');
+    const initialResults = await Promise.all(sources.map((s) => fetchSourceFills(s)));
+    initSpin.stop();
+
+    const processed = new Set<string>();
+    let totalBaseline = 0;
+    for (let i = 0; i < initialResults.length; i++) {
+      const key = sources[i].key;
+      for (const f of initialResults[i]) {
+        processed.add(`${key}:${f.tid}`);
+        totalBaseline++;
+      }
+    }
+
+    success(`Baseline set — ${totalBaseline} existing fills across ${sources.length} source(s). Watching for new trades…`);
+    console.log(chalk.dim('  Press Ctrl+C to stop.\n'));
+
+    // ── Monitoring loop ──
+    let running = true;
+    let mirrored = 0;
+    const shutdown = () => { running = false; };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+
+    while (running) {
+      try {
+        // Fetch from all sources in parallel
+        const results = await Promise.all(
+          sources.map(async (source) => {
+            const fills = await fetchSourceFills(source);
+            return fills
+              .filter((f) => !processed.has(`${source.key}:${f.tid}`))
+              .map((f) => ({ fill: f, sourceKey: source.key }));
+          }),
+        );
+        const newEntries = results.flat().sort((a, b) => Number(a.fill.time) - Number(b.fill.time));
+
+        for (const { fill, sourceKey } of newEntries) {
+          processed.add(`${sourceKey}:${fill.tid}`);
+
+          const dir = String(fill.dir ?? '');
+          const coin = String(fill.coin ?? '');
+          const sz = String(fill.sz ?? '0');
+          const px = Number(fill.px ?? 0);
+          const fillTime = Number(fill.time ?? 0);
+
+          // Only mirror opens and closes
+          const isOpen = dir.startsWith('Open');
+          const isClose = dir.startsWith('Close');
+          if (!isOpen && !isClose) continue;
+
+          const isLong = dir.endsWith('Long');
+          const isBuy = isOpen !== isLong;
+          const reduceOnly = isClose;
+          const action = isOpen ? 'OPEN' : 'CLOSE';
+          const sideLabel = isLong ? chalk.green('LONG') : chalk.red('SHORT');
+          const targetSide = isBuy ? chalk.green('LONG') : chalk.red('SHORT');
+
+          const sourceLabel = sources.find((s) => s.key === sourceKey)?.label ?? sourceKey;
+          const ts = new Date(fillTime).toLocaleTimeString('en-US', { hour12: false });
+          const sourceValueUsd = px * Number(sz);
+          console.log(`\n  ${chalk.dim(ts)}  [${chalk.cyan(sourceLabel)}] ${action}: ${chalk.bold(coin)} ${sideLabel} ${sz} @ $${px.toLocaleString()} (${chalk.dim(`$${sourceValueUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)})`);
+
+          // Get mark price for slippage + size calculation
+          const assets = await perpsApi.getAssetMeta();
+          const meta = assets.find((a) => a.name.toUpperCase() === coin.toUpperCase());
+          const markPx = meta?.markPx ?? px;
+
+          // Calculate target size to match USD position value
+          const szDecimals = meta?.szDecimals ?? 4;
+          const targetSz = (sourceValueUsd / markPx).toFixed(szDecimals);
+
+          if (opts.dryRun) {
+            console.log(`    → ${chalk.yellow('[DRY RUN]')} Would ${isOpen ? 'open' : 'close'} ${targetSide} ${targetSz} ${coin} (~$${sourceValueUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`);
+            continue;
+          }
+
+          // Set leverage for this asset (once per asset)
+          if (!leverageSet.has(coin)) {
+            try {
+              await perpsApi.updateLeverage(creds.accessToken, {
+                symbol: coin,
+                isCross: true,
+                leverage: targetLeverage,
+                subAccountId: walletId,
+              });
+              leverageSet.add(coin);
+            } catch (e) {
+              warn(`  Could not set leverage for ${coin}: ${String(e).slice(0, 80)}`);
+            }
+          }
+
+          const limitPx = (isBuy ? markPx * 1.01 : markPx * 0.99).toPrecision(5);
+
+          const order: PerpsOrder = {
+            a: coin,
+            b: isBuy,
+            p: limitPx,
+            s: targetSz,
+            r: reduceOnly,
+            t: { limit: { tif: 'Ioc' } },
+          };
+
+          const verb = isOpen ? 'Opening' : 'Closing';
+          const spin = spinner(`${verb} ${targetSide} ${targetSz} ${coin}…`);
+          try {
+            const res = await perpsApi.placeOrders(creds.accessToken, {
+              orders: [order],
+              grouping: 'na',
+              subAccountId: walletId,
+            });
+            spin.stop();
+            if (res.success) {
+              mirrored++;
+              success(`  Mirrored → ${verb} ${targetSide} ${targetSz} ${coin} @ ~$${markPx.toLocaleString()}`);
+            } else {
+              warn(`  Failed: ${res.error?.message ?? 'Unknown error'}`);
+            }
+          } catch (e) {
+            spin.stop();
+            warn(`  Error: ${String(e).slice(0, 100)}`);
+          }
+        }
+      } catch (e) {
+        console.log(chalk.dim(`  ${new Date().toLocaleTimeString('en-US', { hour12: false })}  poll error: ${String(e).slice(0, 80)}`));
+      }
+
+      if (running) await new Promise((r) => setTimeout(r, intervalSec * 1000));
+    }
+
+    process.off('SIGINT', shutdown);
+    process.off('SIGTERM', shutdown);
+    console.log('');
+    info(`Mirror stopped. Total mirrored: ${mirrored}`);
   }));
 
 // ─── leverage ────────────────────────────────────────────────────────────
@@ -2322,6 +2604,7 @@ export const perpsCommand = new Command('perps')
   .addCommand(orderCmd)
   .addCommand(cancelCmd)
   .addCommand(closeCmd)
+  .addCommand(mirrorCmd)
   .addCommand(leverageCmd)
   .addCommand(tradesCmd)
   .addCommand(depositCmd)
@@ -2347,6 +2630,7 @@ export const perpsCommand = new Command('perps')
         { name: 'View positions', value: 'positions' },
         { name: 'Place order', value: 'order' },
         { name: 'Close position', value: 'close' },
+        { name: 'Mirror/Hedge (auto opposite)', value: 'mirror' },
         { name: 'Cancel order', value: 'cancel' },
         { name: 'Update leverage', value: 'leverage' },
         { name: 'View trade history', value: 'trades' },
