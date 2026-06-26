@@ -1347,7 +1347,9 @@ const mirrorCmd = new Command('mirror')
               }
             }
 
-            const limitPx = (isBuy ? markPx * 1.02 : markPx * 0.98).toPrecision(5);
+            // Wide slippage (5%) = effective market order for hedging.
+            // Entry price doesn't matter for hedges — only position size does.
+            const limitPx = (isBuy ? markPx * 1.05 : markPx * 0.95).toPrecision(5);
 
             const order: PerpsOrder = {
               a: coin,
