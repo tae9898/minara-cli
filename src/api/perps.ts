@@ -205,10 +205,13 @@ export interface HlAssetInfo extends HlAssetMeta {
 }
 
 let _assetInfoCache: HlAssetInfo[] | null = null;
+let _assetInfoCacheTime = 0;
+const ASSET_CACHE_TTL_MS = 30_000; // 30 seconds — stale prices cause IOC failures
 
-/** Fetch perpetuals universe metadata + live prices from Hyperliquid (cached per session). */
+/** Fetch perpetuals universe metadata + live prices from Hyperliquid (cached for 30s). */
 export async function getAssetMeta(): Promise<HlAssetInfo[]> {
-  if (_assetInfoCache) return _assetInfoCache;
+  const now = Date.now();
+  if (_assetInfoCache && (now - _assetInfoCacheTime) < ASSET_CACHE_TTL_MS) return _assetInfoCache;
   try {
     const res = await fetch('https://api.hyperliquid.xyz/info', {
       method: 'POST',
@@ -224,9 +227,10 @@ export async function getAssetMeta(): Promise<HlAssetInfo[]> {
       ...m,
       markPx: Number(ctxs?.[i]?.markPx ?? 0),
     }));
+    _assetInfoCacheTime = now;
     return _assetInfoCache;
   } catch {
-    return [];
+    return _assetInfoCache ?? [];
   }
 }
 
@@ -317,6 +321,42 @@ export async function getUserLeverage(address: string): Promise<HlLeverageInfo[]
       leverageType: ap.position.leverage.type,
       leverageValue: ap.position.leverage.value,
       maxLeverage: ap.position.maxLeverage,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export interface HlPosition {
+  coin: string;
+  szi: number; // signed size: positive = long, negative = short
+  entryPx: number;
+  unrealizedPnl: number;
+}
+
+/** Fetch user's open positions from Hyperliquid clearinghouseState. */
+export async function getUserPositions(address: string): Promise<HlPosition[]> {
+  try {
+    const res = await fetch('https://api.hyperliquid.xyz/info', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'clearinghouseState', user: address }),
+    });
+    const data = (await res.json()) as {
+      assetPositions?: {
+        position: {
+          coin: string;
+          szi: string;
+          entryPx?: string;
+          unrealizedPnl?: string;
+        };
+      }[];
+    };
+    return (data.assetPositions ?? []).map((ap) => ({
+      coin: ap.position.coin,
+      szi: parseFloat(ap.position.szi),
+      entryPx: parseFloat(ap.position.entryPx ?? '0'),
+      unrealizedPnl: parseFloat(ap.position.unrealizedPnl ?? '0'),
     }));
   } catch {
     return [];

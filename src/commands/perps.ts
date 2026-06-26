@@ -1208,145 +1208,193 @@ const mirrorCmd = new Command('mirror')
     }
     if (!opts.dryRun) await requireTouchId();
 
-    // ── Helper: fetch fills from a source (sub-account API or public API) ──
-    const fetchSourceFills = async (source: SourceWallet): Promise<Record<string, unknown>[]> => {
-      const startTime = Date.now() - 24 * 60 * 60 * 1000;
-      if (source.subAccountId) {
-        const res = await perpsApi.getSubAccountFills(creds.accessToken, source.subAccountId, startTime);
-        return res.success && Array.isArray(res.data) ? res.data as Record<string, unknown>[] : [];
+    // ── Helper: fetch current positions from a source ──
+    const fetchSourcePositions = async (source: SourceWallet): Promise<Map<string, number>> => {
+      const positions = new Map<string, number>();
+      try {
+        if (source.subAccountId) {
+          const res = await perpsApi.getSubAccountSummary(creds.accessToken, source.subAccountId);
+          if (res.success && res.data) {
+            const raw = res.data as Record<string, unknown>;
+            // Try Hyperliquid format: assetPositions[].position.{coin, szi}
+            const rawAssetPositions = Array.isArray(raw.assetPositions)
+              ? (raw.assetPositions as Record<string, unknown>[])
+              : null;
+            // Try Minara flattened format: positions[].{symbol/coin, side, size}
+            const rawPositions = Array.isArray(raw.positions)
+              ? (raw.positions as Record<string, unknown>[])
+              : null;
+
+            if (rawAssetPositions) {
+              for (const ap of rawAssetPositions) {
+                const pos = (ap.position && typeof ap.position === 'object' ? ap.position : ap) as Record<string, unknown>;
+                const coin = String(pos.coin ?? '');
+                const szi = parseFloat(String(pos.szi ?? 0));
+                if (coin && szi !== 0) positions.set(coin, szi);
+              }
+            } else if (rawPositions) {
+              for (const pos of rawPositions) {
+                const coin = String(pos.symbol ?? pos.coin ?? '');
+                const side = String(pos.side ?? '').toLowerCase();
+                const size = Math.abs(parseFloat(String(pos.size ?? pos.szi ?? 0)));
+                const szi = size === 0 ? 0 : (side === 'long' || side === 'buy' ? size : -size);
+                if (coin && szi !== 0) positions.set(coin, szi);
+              }
+            } else {
+              // Debug: log raw keys to help diagnose format issues
+              console.log(chalk.dim(`    [debug] ${source.label} summary keys: ${Object.keys(raw).join(', ')}`));
+            }
+          } else {
+            console.log(chalk.dim(`    [debug] ${source.label} API returned: success=${res.success}`));
+          }
+        } else if (source.address) {
+          const userPositions = await perpsApi.getUserPositions(source.address);
+          for (const p of userPositions) {
+            if (p.coin && p.szi !== 0) positions.set(p.coin, p.szi);
+          }
+        }
+      } catch (e) {
+        console.log(chalk.dim(`    [debug] ${source.label} fetch error: ${String(e).slice(0, 100)}`));
       }
-      if (source.address) {
-        return await perpsApi.getUserFills(source.address, 1) as unknown as Record<string, unknown>[];
-      }
-      return [];
+      return positions;
     };
 
-    // ── Baseline ──
+    // ── Baseline: record initial positions ──
     const initSpin = spinner('Establishing baseline…');
-    const initialResults = await Promise.all(sources.map((s) => fetchSourceFills(s)));
+    const lastPositions = new Map<string, Map<string, number>>();
+    const initialResults = await Promise.all(sources.map(async (s) => {
+      const pos = await fetchSourcePositions(s);
+      lastPositions.set(s.key, pos);
+      return { source: s, positions: pos };
+    }));
     initSpin.stop();
 
-    const processed = new Set<string>();
-    let totalBaseline = 0;
-    for (let i = 0; i < initialResults.length; i++) {
-      const key = sources[i].key;
-      for (const f of initialResults[i]) {
-        processed.add(`${key}:${f.tid}`);
-        totalBaseline++;
-      }
+    let totalPositions = 0;
+    for (const { source, positions } of initialResults) {
+      const posStr = positions.size > 0
+        ? [...positions.entries()].map(([coin, szi]) => `${coin} ${szi > 0 ? 'LONG' : 'SHORT'} ${Math.abs(szi)}`).join(', ')
+        : 'no positions';
+      console.log(chalk.dim(`    ${source.label}: ${posStr}`));
+      totalPositions += positions.size;
     }
 
-    success(`Baseline set — ${totalBaseline} existing fills across ${sources.length} source(s). Watching for new trades…`);
+    success(`Baseline set — ${totalPositions} position(s) across ${sources.length} source(s). Watching for changes…`);
     console.log(chalk.dim('  Press Ctrl+C to stop.\n'));
 
     // ── Monitoring loop ──
     let running = true;
     let mirrored = 0;
+    let pollCount = 0;
     const shutdown = () => { running = false; };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
     while (running) {
       try {
-        // Fetch from all sources in parallel
-        const results = await Promise.all(
-          sources.map(async (source) => {
-            const fills = await fetchSourceFills(source);
-            return fills
-              .filter((f) => !processed.has(`${source.key}:${f.tid}`))
-              .map((f) => ({ fill: f, sourceKey: source.key }));
-          }),
-        );
-        const newEntries = results.flat().sort((a, b) => Number(a.fill.time) - Number(b.fill.time));
+        for (const source of sources) {
+          const current = await fetchSourcePositions(source);
+          const previous = lastPositions.get(source.key) ?? new Map<string, number>();
 
-        for (const { fill, sourceKey } of newEntries) {
-          processed.add(`${sourceKey}:${fill.tid}`);
+          // Find all coins in either snapshot
+          const allCoins = new Set([...previous.keys(), ...current.keys()]);
 
-          const dir = String(fill.dir ?? '');
-          const coin = String(fill.coin ?? '');
-          const sz = String(fill.sz ?? '0');
-          const px = Number(fill.px ?? 0);
-          const fillTime = Number(fill.time ?? 0);
+          for (const coin of allCoins) {
+            const oldSize = previous.get(coin) ?? 0;
+            const newSize = current.get(coin) ?? 0;
+            const delta = newSize - oldSize;
+            if (Math.abs(delta) < 0.0001) continue; // skip negligible changes
 
-          // Only mirror opens and closes
-          const isOpen = dir.startsWith('Open');
-          const isClose = dir.startsWith('Close');
-          if (!isOpen && !isClose) continue;
+            // Source delta > 0 → source increased long (or reduced short) → mirror sells
+            // Source delta < 0 → source increased short (or reduced long) → mirror buys
+            const isBuy = delta < 0;
+            const action = newSize === 0 ? 'CLOSE' : oldSize === 0 ? 'OPEN' : 'ADJUST';
+            const sideLabel = delta > 0 ? chalk.green('LONG') : chalk.red('SHORT');
+            const targetSide = isBuy ? chalk.green('LONG') : chalk.red('SHORT');
 
-          const isLong = dir.endsWith('Long');
-          const isBuy = isOpen !== isLong;
-          const reduceOnly = isClose;
-          const action = isOpen ? 'OPEN' : 'CLOSE';
-          const sideLabel = isLong ? chalk.green('LONG') : chalk.red('SHORT');
-          const targetSide = isBuy ? chalk.green('LONG') : chalk.red('SHORT');
+            // Get mark price
+            const assets = await perpsApi.getAssetMeta();
+            const meta = assets.find((a) => a.name.toUpperCase() === coin.toUpperCase());
+            const markPx = meta?.markPx ?? 0;
+            if (markPx <= 0) {
+              warn(`  Could not fetch price for ${coin}, skipping`);
+              continue;
+            }
 
-          const sourceLabel = sources.find((s) => s.key === sourceKey)?.label ?? sourceKey;
-          const ts = new Date(fillTime).toLocaleTimeString('en-US', { hour12: false });
-          const sourceValueUsd = px * Number(sz);
-          console.log(`\n  ${chalk.dim(ts)}  [${chalk.cyan(sourceLabel)}] ${action}: ${chalk.bold(coin)} ${sideLabel} ${sz} @ $${px.toLocaleString()} (${chalk.dim(`$${sourceValueUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)})`);
+            const szDecimals = meta?.szDecimals ?? 4;
+            const deltaSz = Math.abs(delta).toFixed(szDecimals);
+            const deltaUsd = Math.abs(delta) * markPx;
 
-          // Get mark price for slippage + size calculation
-          const assets = await perpsApi.getAssetMeta();
-          const meta = assets.find((a) => a.name.toUpperCase() === coin.toUpperCase());
-          const markPx = meta?.markPx ?? px;
+            const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+            console.log(`\n  ${chalk.dim(ts)}  [${chalk.cyan(source.label)}] ${action}: ${chalk.bold(coin)} ${sideLabel} ${deltaSz} (${chalk.dim(`$${deltaUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)})`);
 
-          // Calculate target size to match USD position value
-          const szDecimals = meta?.szDecimals ?? 4;
-          const targetSz = (sourceValueUsd / markPx).toFixed(szDecimals);
+            if (opts.dryRun) {
+              console.log(`    → ${chalk.yellow('[DRY RUN]')} Would ${isBuy ? 'buy' : 'sell'} ${deltaSz} ${coin} (~$${deltaUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`);
+              continue;
+            }
 
-          if (opts.dryRun) {
-            console.log(`    → ${chalk.yellow('[DRY RUN]')} Would ${isOpen ? 'open' : 'close'} ${targetSide} ${targetSz} ${coin} (~$${sourceValueUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`);
-            continue;
-          }
+            // Set leverage for this asset (once per asset)
+            if (!leverageSet.has(coin)) {
+              try {
+                await perpsApi.updateLeverage(creds.accessToken, {
+                  symbol: coin,
+                  isCross: true,
+                  leverage: targetLeverage,
+                  subAccountId: walletId,
+                });
+                leverageSet.add(coin);
+              } catch (e) {
+                warn(`  Could not set leverage for ${coin}: ${String(e).slice(0, 80)}`);
+              }
+            }
 
-          // Set leverage for this asset (once per asset)
-          if (!leverageSet.has(coin)) {
+            const limitPx = (isBuy ? markPx * 1.02 : markPx * 0.98).toPrecision(5);
+
+            const order: PerpsOrder = {
+              a: coin,
+              b: isBuy,
+              p: limitPx,
+              s: deltaSz,
+              r: false,
+              t: { limit: { tif: 'Ioc' } },
+            };
+
+            const verb = action === 'CLOSE' ? 'Closing' : action === 'OPEN' ? 'Opening' : 'Adjusting';
+            const spin = spinner(`${verb} ${targetSide} ${deltaSz} ${coin}…`);
             try {
-              await perpsApi.updateLeverage(creds.accessToken, {
-                symbol: coin,
-                isCross: true,
-                leverage: targetLeverage,
+              const res = await perpsApi.placeOrders(creds.accessToken, {
+                orders: [order],
+                grouping: 'na',
                 subAccountId: walletId,
               });
-              leverageSet.add(coin);
+              spin.stop();
+              if (res.success) {
+                mirrored++;
+                success(`  Mirrored → ${verb} ${targetSide} ${deltaSz} ${coin} @ ~$${markPx.toLocaleString()}`);
+              } else {
+                warn(`  Failed: ${res.error?.message ?? 'Unknown error'}`);
+              }
             } catch (e) {
-              warn(`  Could not set leverage for ${coin}: ${String(e).slice(0, 80)}`);
+              spin.stop();
+              warn(`  Error: ${String(e).slice(0, 100)}`);
             }
           }
 
-          const limitPx = (isBuy ? markPx * 1.01 : markPx * 0.99).toPrecision(5);
-
-          const order: PerpsOrder = {
-            a: coin,
-            b: isBuy,
-            p: limitPx,
-            s: targetSz,
-            r: reduceOnly,
-            t: { limit: { tif: 'Ioc' } },
-          };
-
-          const verb = isOpen ? 'Opening' : 'Closing';
-          const spin = spinner(`${verb} ${targetSide} ${targetSz} ${coin}…`);
-          try {
-            const res = await perpsApi.placeOrders(creds.accessToken, {
-              orders: [order],
-              grouping: 'na',
-              subAccountId: walletId,
-            });
-            spin.stop();
-            if (res.success) {
-              mirrored++;
-              success(`  Mirrored → ${verb} ${targetSide} ${targetSz} ${coin} @ ~$${markPx.toLocaleString()}`);
-            } else {
-              warn(`  Failed: ${res.error?.message ?? 'Unknown error'}`);
-            }
-          } catch (e) {
-            spin.stop();
-            warn(`  Error: ${String(e).slice(0, 100)}`);
-          }
+          lastPositions.set(source.key, current);
         }
       } catch (e) {
         console.log(chalk.dim(`  ${new Date().toLocaleTimeString('en-US', { hour12: false })}  poll error: ${String(e).slice(0, 80)}`));
+      }
+
+      pollCount++;
+      // Heartbeat every ~1 minute (6 polls at 10s, or adjust for interval)
+      if (pollCount % Math.max(1, Math.round(60 / intervalSec)) === 0) {
+        const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+        const summary = sources.map((s) => {
+          const pos = lastPositions.get(s.key);
+          const count = pos?.size ?? 0;
+          return `${s.label}: ${count} pos`;
+        }).join(', ');
+        console.log(chalk.dim(`  ${ts}  [heartbeat] poll #${pollCount}, ${summary}`));
       }
 
       if (running) await new Promise((r) => setTimeout(r, intervalSec * 1000));
