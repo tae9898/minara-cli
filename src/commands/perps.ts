@@ -1085,16 +1085,31 @@ interface MirrorOpts {
   yes?: boolean;
   wallet?: string;
   leverage?: string;
+  /** minimum notional % of current position size to act on (default 1.0) */
+  mismatchThreshold?: string;
+  /** consecutive failures per coin before flatten+halt (default 5) */
+  maxRetries?: string;
+  /** block new orders above this margin ratio 0..1 (default 0.80) */
+  marginCeiling?: string;
+  /** stop-loss % off entry for new hedge opens, 0 = off (default 0) */
+  stopLoss?: string;
+  /** only hedge changes after startup, ignoring pre-existing source positions */
+  baselineOnly?: boolean;
 }
 
 const mirrorCmd = new Command('mirror')
-  .description('Monitor a wallet and auto-open opposite positions (hedge)')
+  .description('Monitor a wallet and auto-open opposite positions (hedge) via net-exposure reconciliation')
   .option('--source <addresses>', 'Source wallet(s) to monitor, comma-separated (0x… or wallet name)')
   .option(WALLET_OPT[0], WALLET_OPT[1])
   .option('-i, --interval <seconds>', 'Polling interval in seconds', '10')
   .option('--leverage <n>', 'Target wallet leverage (fixed)', '40')
   .option('--dry-run', 'Simulate without placing real orders')
   .option('-y, --yes', 'Skip confirmation')
+  .option('--mismatch-threshold <pct>', 'Skip corrections under <pct>% of position notional (noise filter)', '1.0')
+  .option('--max-retries <n>', 'Flatten + halt a coin after <n> consecutive correction failures', '5')
+  .option('--margin-ceiling <pct>', 'Block new orders when target margin ratio exceeds <pct> (0..1)', '0.80')
+  .option('--stop-loss <pct>', 'Attach SL trigger <pct>% off entry on new hedge opens (0 = off)', '0')
+  .option('--baseline-only', 'Ignore source positions at startup (only hedge subsequent changes)')
   .action(wrapAction(async (opts: MirrorOpts) => {
     const creds = requireAuth();
 
@@ -1187,6 +1202,13 @@ const mirrorCmd = new Command('mirror')
     const targetLeverage = Math.max(1, parseInt(opts.leverage ?? '40', 10) || 40);
     const leverageSet = new Set<string>();
 
+    // New safety parameters
+    const mismatchThresholdPct = Math.max(0, parseFloat(opts.mismatchThreshold ?? '1.0') || 0);
+    const maxRetries = Math.max(1, parseInt(opts.maxRetries ?? '5', 10) || 5);
+    const marginCeiling = Math.min(1, Math.max(0, parseFloat(opts.marginCeiling ?? '0.80') || 0));
+    const stopLossPct = Math.max(0, parseFloat(opts.stopLoss ?? '0') || 0);
+    const baselineOnly = !!opts.baselineOnly;
+
     // Summary
     console.log('');
     console.log(chalk.bold('Mirror / Hedge Setup:'));
@@ -1198,8 +1220,12 @@ const mirrorCmd = new Command('mirror')
     console.log(`  Target (hedge)   : ${getSubAccountLabel(wallet)}`);
     console.log(`  Interval         : ${intervalSec}s`);
     console.log(`  Leverage         : ${chalk.cyan(`${targetLeverage}x (cross)`)}`);
-    console.log(`  Size matching    : ${chalk.dim('USD value')}`);
     console.log(`  Mode             : ${opts.dryRun ? chalk.yellow('DRY RUN') : chalk.red('LIVE')}`);
+    console.log(`  Strategy         : ${chalk.cyan('net-exposure reconciliation')} (baseline-only=${baselineOnly})`);
+    console.log(`  Mismatch filter  : ${chalk.dim(`< ${mismatchThresholdPct}% of position notional`)}`);
+    console.log(`  Max retries      : ${chalk.dim(`${maxRetries} per coin → flatten + halt`)}`);
+    console.log(`  Margin ceiling   : ${chalk.dim(`${(marginCeiling * 100).toFixed(1)}%`)}`);
+    console.log(`  Stop-loss        : ${stopLossPct > 0 ? chalk.yellow(`${stopLossPct}% off entry (new opens)`) : chalk.dim('off')}`);
     console.log('');
 
     if (!opts.yes) {
@@ -1259,144 +1285,310 @@ const mirrorCmd = new Command('mirror')
       return positions;
     };
 
-    // ── Baseline: record initial positions ──
-    const initSpin = spinner('Establishing baseline…');
-    const lastPositions = new Map<string, Map<string, number>>();
-    const initialResults = await Promise.all(sources.map(async (s) => {
-      const pos = await fetchSourcePositions(s);
-      lastPositions.set(s.key, pos);
-      return { source: s, positions: pos };
-    }));
-    initSpin.stop();
+    // ── Helper: fetch target (mirror) account positions + margin ratio ──
+    const fetchTargetState = async (): Promise<{ positions: Map<string, number>; marginRatio: number }> => {
+      const positions = new Map<string, number>();
+      let marginRatio = 0;
+      try {
+        let raw: Record<string, unknown> = {};
+        if (walletId) {
+          const res = await perpsApi.getSubAccountSummary(creds.accessToken, walletId);
+          if (res.success && res.data) raw = res.data as Record<string, unknown>;
+        } else {
+          const res = await perpsApi.getAccountSummary(creds.accessToken);
+          if (res.success && res.data) raw = res.data as Record<string, unknown>;
+        }
 
-    let totalPositions = 0;
-    for (const { source, positions } of initialResults) {
-      const posStr = positions.size > 0
-        ? [...positions.entries()].map(([coin, szi]) => `${coin} ${szi > 0 ? 'LONG' : 'SHORT'} ${Math.abs(szi)}`).join(', ')
-        : 'no positions';
-      console.log(chalk.dim(`    ${source.label}: ${posStr}`));
-      totalPositions += positions.size;
+        const margin = raw.marginSummary as Record<string, unknown> | undefined;
+        const accountValue = margin
+          ? parseFloat(String(margin.accountValue ?? 0))
+          : Number(raw.equityValue ?? raw.accountValue ?? 0);
+        const totalMarginUsed = margin
+          ? parseFloat(String(margin.totalMarginUsed ?? 0))
+          : Number(raw.totalMarginUsed ?? 0);
+        marginRatio = accountValue > 0 ? totalMarginUsed / accountValue : 0;
+
+        const rawAssetPositions = Array.isArray(raw.assetPositions)
+          ? (raw.assetPositions as Record<string, unknown>[])
+          : [];
+        if (rawAssetPositions.length > 0) {
+          for (const ap of rawAssetPositions) {
+            const pos = (ap.position && typeof ap.position === 'object' ? ap.position : ap) as Record<string, unknown>;
+            const coin = String(pos.coin ?? '');
+            const szi = parseFloat(String(pos.szi ?? 0));
+            if (coin && szi !== 0) positions.set(coin, szi);
+          }
+        } else if (Array.isArray(raw.positions)) {
+          for (const pos of raw.positions as Record<string, unknown>[]) {
+            const coin = String(pos.symbol ?? pos.coin ?? '');
+            const side = String(pos.side ?? '').toLowerCase();
+            const size = Math.abs(parseFloat(String(pos.size ?? pos.szi ?? 0)));
+            const szi = size === 0 ? 0 : (side === 'long' || side === 'buy' ? size : -size);
+            if (coin && szi !== 0) positions.set(coin, szi);
+          }
+        }
+      } catch (e) {
+        console.log(chalk.dim(`    [debug] target fetch error: ${String(e).slice(0, 100)}`));
+      }
+      return { positions, marginRatio };
+    };
+
+    // ── Helper: decide reduceOnly per the mixed policy ──
+    // mismatch that purely shrinks the current target position → reduceOnly
+    // (opposite sign AND |mismatch| ≤ |current|). Otherwise false.
+    const isPureReduction = (currentTarget: number, mismatch: number): boolean => {
+      if (currentTarget === 0) return false;                          // new open
+      if (Math.sign(mismatch) === Math.sign(currentTarget)) return false; // expand same direction
+      if (Math.abs(mismatch) > Math.abs(currentTarget)) return false; // flip
+      return true;                                                     // partial or full close
+    };
+
+    // ── Helper: emergency flatten one coin to flat (reduce-only IOC) ──
+    const flattenCoin = async (
+      coin: string,
+      currentSize: number,
+      markPx: number,
+      szDecimals: number,
+    ): Promise<boolean> => {
+      const isBuy = currentSize < 0; // opposite of position direction
+      const size = Math.abs(currentSize).toFixed(szDecimals);
+      const limitPx = (isBuy ? markPx * 1.05 : markPx * 0.95).toPrecision(5);
+      const order: PerpsOrder = {
+        a: coin,
+        b: isBuy,
+        p: limitPx,
+        s: size,
+        r: true,
+        t: { limit: { tif: 'Ioc' } },
+      };
+      try {
+        const res = await perpsApi.placeOrders(creds.accessToken, {
+          orders: [order],
+          grouping: 'na',
+          subAccountId: walletId,
+        });
+        return !!res.success;
+      } catch {
+        return false;
+      }
+    };
+
+    // ── Baseline (only used when --baseline-only) ──
+    // When baselineOnly is false (default), the first poll reconciles existing
+    // source positions immediately (pure reconciliation mode).
+    const sourceBaseline = new Map<string, Map<string, number>>();
+    if (baselineOnly) {
+      const initSpin = spinner('Establishing baseline…');
+      for (const s of sources) {
+        sourceBaseline.set(s.key, await fetchSourcePositions(s));
+      }
+      initSpin.stop();
+      for (const s of sources) {
+        const pos = sourceBaseline.get(s.key) ?? new Map<string, number>();
+        const posStr = pos.size > 0
+          ? [...pos.entries()].map(([coin, szi]) => `${coin} ${szi > 0 ? 'LONG' : 'SHORT'} ${Math.abs(szi)}`).join(', ')
+          : 'no positions';
+        console.log(chalk.dim(`    ${s.label}: ${posStr}`));
+      }
+      success(`Baseline set — ${sources.length} source(s). Only changes after startup will be hedged.`);
+    } else {
+      success(`Pure reconciliation mode — existing source positions will be hedged on first poll.`);
     }
-
-    success(`Baseline set — ${totalPositions} position(s) across ${sources.length} source(s). Watching for changes…`);
     console.log(chalk.dim('  Press Ctrl+C to stop.\n'));
+
+    // ── Reconciliation state ──
+    const consecutiveFailures = new Map<string, number>();
+    const haltedCoins = new Set<string>();
 
     // ── Monitoring loop ──
     let running = true;
-    let mirrored = 0;
+    let reconciled = 0;
     let pollCount = 0;
+    let lastMarginRatio = 0;
     const shutdown = () => { running = false; };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
     while (running) {
       try {
+        // 1. Fetch target state (positions + margin)
+        const { positions: targetPositions, marginRatio } = await fetchTargetState();
+        lastMarginRatio = marginRatio;
+
+        // 2. Aggregate signed source sizes (net of baseline if --baseline-only)
+        const sourceAggregate = new Map<string, number>();
         for (const source of sources) {
-          const current = await fetchSourcePositions(source);
-          const previous = lastPositions.get(source.key) ?? new Map<string, number>();
-
-          // Find all coins in either snapshot
-          const allCoins = new Set([...previous.keys(), ...current.keys()]);
-
-          for (const coin of allCoins) {
-            const oldSize = previous.get(coin) ?? 0;
-            const newSize = current.get(coin) ?? 0;
-            const delta = newSize - oldSize;
-            if (Math.abs(delta) < 0.0001) continue; // skip negligible changes
-
-            // Source delta > 0 → source increased long (or reduced short) → mirror sells
-            // Source delta < 0 → source increased short (or reduced long) → mirror buys
-            const isBuy = delta < 0;
-            const action = newSize === 0 ? 'CLOSE' : oldSize === 0 ? 'OPEN' : 'ADJUST';
-            const sideLabel = delta > 0 ? chalk.green('LONG') : chalk.red('SHORT');
-            const targetSide = isBuy ? chalk.green('LONG') : chalk.red('SHORT');
-
-            // Get mark price
-            const assets = await perpsApi.getAssetMeta();
-            const meta = assets.find((a) => a.name.toUpperCase() === coin.toUpperCase());
-            const markPx = meta?.markPx ?? 0;
-            if (markPx <= 0) {
-              warn(`  Could not fetch price for ${coin}, skipping`);
-              continue;
+          const pos = await fetchSourcePositions(source);
+          const baseline = baselineOnly ? (sourceBaseline.get(source.key) ?? new Map<string, number>()) : null;
+          if (baseline) {
+            // Include coins that exist in baseline but disappeared from current
+            const allSourceCoins = new Set([...pos.keys(), ...baseline.keys()]);
+            for (const coin of allSourceCoins) {
+              const szi = pos.get(coin) ?? 0;
+              const baseVal = baseline.get(coin) ?? 0;
+              const net = szi - baseVal;
+              if (net !== 0) sourceAggregate.set(coin, (sourceAggregate.get(coin) ?? 0) + net);
             }
-
-            const szDecimals = meta?.szDecimals ?? 4;
-            const deltaSz = Math.abs(delta).toFixed(szDecimals);
-            const deltaUsd = Math.abs(delta) * markPx;
-
-            const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-            console.log(`\n  ${chalk.dim(ts)}  [${chalk.cyan(source.label)}] ${action}: ${chalk.bold(coin)} ${sideLabel} ${deltaSz} (${chalk.dim(`$${deltaUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)})`);
-
-            if (opts.dryRun) {
-              console.log(`    → ${chalk.yellow('[DRY RUN]')} Would ${isBuy ? 'buy' : 'sell'} ${deltaSz} ${coin} (~$${deltaUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`);
-              continue;
+          } else {
+            for (const [coin, szi] of pos) {
+              if (szi !== 0) sourceAggregate.set(coin, (sourceAggregate.get(coin) ?? 0) + szi);
             }
+          }
+        }
 
-            // Set leverage for this asset (once per asset)
-            if (!leverageSet.has(coin)) {
-              try {
-                await perpsApi.updateLeverage(creds.accessToken, {
-                  symbol: coin,
-                  isCross: true,
-                  leverage: targetLeverage,
-                  subAccountId: walletId,
-                });
-                leverageSet.add(coin);
-              } catch (e) {
-                warn(`  Could not set leverage for ${coin}: ${String(e).slice(0, 80)}`);
-              }
+        // 3. Asset metadata (prices + szDecimals) once per poll
+        const assets = await perpsApi.getAssetMeta();
+
+        // 4. Margin ceiling: block new orders for this entire poll
+        let marginBlocked = marginRatio > marginCeiling;
+        if (marginBlocked) {
+          warn(`  Margin ratio ${(marginRatio * 100).toFixed(1)}% exceeds ceiling ${(marginCeiling * 100).toFixed(1)}% — new orders blocked this poll (monitoring continues)`);
+        }
+
+        // 5. Reconcile every coin present on either side
+        const allCoins = new Set<string>([...targetPositions.keys(), ...sourceAggregate.keys()]);
+        for (const coin of allCoins) {
+          if (haltedCoins.has(coin)) continue;
+
+          const expected = -(sourceAggregate.get(coin) ?? 0); // desired target position
+          const actual = targetPositions.get(coin) ?? 0;       // current target position
+          const mismatch = expected - actual;                  // signed correction
+
+          const meta = assets.find((a) => a.name.toUpperCase() === coin.toUpperCase());
+          const markPx = meta?.markPx ?? 0;
+          if (markPx <= 0) {
+            warn(`  Could not fetch price for ${coin}, skipping`);
+            continue;
+          }
+
+          const szDecimals = meta?.szDecimals ?? 4;
+          const mismatchNotional = Math.abs(mismatch) * markPx;
+          // Threshold: max(<pct>% of current position notional, $5 absolute floor)
+          const positionNotional = Math.abs(actual) * markPx;
+          const thresholdNotional = Math.max(
+            positionNotional * (mismatchThresholdPct / 100),
+            5,
+          );
+          if (mismatchNotional < thresholdNotional) continue; // noise filter
+
+          // Retry limit — flatten + halt this coin
+          const fails = consecutiveFailures.get(coin) ?? 0;
+          if (fails >= maxRetries) {
+            warn(`  ${coin} exceeded ${maxRetries} consecutive failures — emergency flatten + halt`);
+            if (!opts.dryRun && actual !== 0) {
+              const ok = await flattenCoin(coin, actual, markPx, szDecimals);
+              if (ok) success(`  Flattened ${coin} to flat`);
+              else warn(`  Failed to flatten ${coin} — manual intervention required`);
+            } else if (opts.dryRun && actual !== 0) {
+              console.log(`    ${chalk.yellow('[DRY RUN]')} Would flatten ${coin} (${actual})`);
             }
+            haltedCoins.add(coin);
+            continue;
+          }
 
-            // Wide slippage (5%) = effective market order for hedging.
-            // Entry price doesn't matter for hedges — only position size does.
-            const limitPx = (isBuy ? markPx * 1.05 : markPx * 0.95).toPrecision(5);
+          // Skip new orders when margin ceiling exceeded (but still monitor)
+          if (marginBlocked) continue;
 
-            const order: PerpsOrder = {
-              a: coin,
-              b: isBuy,
-              p: limitPx,
-              s: deltaSz,
-              r: false,
-              t: { limit: { tif: 'Ioc' } },
-            };
+          const isBuy = mismatch > 0;
+          const reduceOnly = isPureReduction(actual, mismatch);
+          const size = Math.abs(mismatch).toFixed(szDecimals);
+          const limitPx = (isBuy ? markPx * 1.05 : markPx * 0.95).toPrecision(5);
 
-            const verb = action === 'CLOSE' ? 'Closing' : action === 'OPEN' ? 'Opening' : 'Adjusting';
-            const spin = spinner(`${verb} ${targetSide} ${deltaSz} ${coin}…`);
+          // Classify action for log readability
+          const verb = actual === 0
+            ? 'OPEN'
+            : reduceOnly
+              ? 'REDUCE'
+              : (Math.sign(mismatch) === Math.sign(actual) ? 'EXPAND' : 'FLIP');
+          const sideLabel = isBuy ? chalk.green('BUY') : chalk.red('SELL');
+
+          const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+          console.log(`\n  ${chalk.dim(ts)}  ${chalk.bold(coin)} mismatch=${mismatch > 0 ? '+' : ''}${mismatch.toFixed(szDecimals)} → ${verb} ${sideLabel} ${size} (${chalk.dim(`$${mismatchNotional.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)})`);
+
+          if (opts.dryRun) {
+            const slTag = (stopLossPct > 0 && actual === 0) ? ` +SL ${stopLossPct}%` : '';
+            console.log(`    ${chalk.yellow('[DRY RUN]')} Would place ${reduceOnly ? 'reduce-only ' : ''}${isBuy ? 'buy' : 'sell'} ${size} ${coin} @ ~$${markPx.toLocaleString()}${slTag}`);
+            continue;
+          }
+
+          // Set leverage once per coin
+          if (!leverageSet.has(coin)) {
             try {
-              const res = await perpsApi.placeOrders(creds.accessToken, {
-                orders: [order],
-                grouping: 'na',
+              await perpsApi.updateLeverage(creds.accessToken, {
+                symbol: coin,
+                isCross: true,
+                leverage: targetLeverage,
                 subAccountId: walletId,
               });
-              spin.stop();
-              if (res.success) {
-                mirrored++;
-                success(`  Mirrored → ${verb} ${targetSide} ${deltaSz} ${coin} @ ~$${markPx.toLocaleString()}`);
-              } else {
-                warn(`  Failed: ${res.error?.message ?? 'Unknown error'}`);
-              }
+              leverageSet.add(coin);
             } catch (e) {
-              spin.stop();
-              warn(`  Error: ${String(e).slice(0, 100)}`);
+              warn(`  Could not set leverage for ${coin}: ${String(e).slice(0, 80)}`);
             }
           }
 
-          lastPositions.set(source.key, current);
+          // Build orders (entry + optional SL trigger)
+          const orders: PerpsOrder[] = [{
+            a: coin,
+            b: isBuy,
+            p: limitPx,
+            s: size,
+            r: reduceOnly,
+            t: { limit: { tif: 'Ioc' } },
+          }];
+
+          // SL trigger only on brand-new opens
+          const isOpeningNew = actual === 0;
+          if (stopLossPct > 0 && isOpeningNew) {
+            const triggerPx = (isBuy
+              ? markPx * (1 - stopLossPct / 100)
+              : markPx * (1 + stopLossPct / 100)
+            ).toPrecision(5);
+            orders.push({
+              a: coin,
+              b: !isBuy, // opposite side — triggers close
+              p: triggerPx,
+              s: size,
+              r: true,
+              t: { trigger: { triggerPx, tpsl: 'sl', isMarket: true } },
+            });
+          }
+
+          const grouping: 'na' | 'normalTpsl' = orders.length > 1 ? 'normalTpsl' : 'na';
+          const spin = spinner(`${verb} ${isBuy ? 'BUY' : 'SELL'} ${size} ${coin}…`);
+          try {
+            const res = await perpsApi.placeOrders(creds.accessToken, {
+              orders,
+              grouping,
+              subAccountId: walletId,
+            });
+            spin.stop();
+            if (res.success) {
+              reconciled++;
+              consecutiveFailures.set(coin, 0);
+              const slTag = (stopLossPct > 0 && isOpeningNew) ? ` (SL ${stopLossPct}%)` : '';
+              success(`  Reconciled ${coin} → ${isBuy ? 'buy' : 'sell'} ${size}${slTag}`);
+            } else {
+              consecutiveFailures.set(coin, fails + 1);
+              warn(`  Failed (${fails + 1}/${maxRetries}): ${res.error?.message ?? 'Unknown error'}`);
+            }
+          } catch (e) {
+            spin.stop();
+            consecutiveFailures.set(coin, fails + 1);
+            warn(`  Error (${fails + 1}/${maxRetries}): ${String(e).slice(0, 100)}`);
+          }
         }
       } catch (e) {
         console.log(chalk.dim(`  ${new Date().toLocaleTimeString('en-US', { hour12: false })}  poll error: ${String(e).slice(0, 80)}`));
       }
 
       pollCount++;
-      // Heartbeat every ~1 minute (6 polls at 10s, or adjust for interval)
+      // Heartbeat every ~60 seconds
       if (pollCount % Math.max(1, Math.round(60 / intervalSec)) === 0) {
         const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-        const summary = sources.map((s) => {
-          const pos = lastPositions.get(s.key);
-          const count = pos?.size ?? 0;
-          return `${s.label}: ${count} pos`;
-        }).join(', ');
-        console.log(chalk.dim(`  ${ts}  [heartbeat] poll #${pollCount}, ${summary}`));
+        const failSummary = consecutiveFailures.size > 0
+          ? [...consecutiveFailures.entries()].map(([c, n]) => `${c}:${n}`).join(' ')
+          : 'none';
+        console.log(chalk.dim(`  ${ts}  [heartbeat] poll #${pollCount}, margin=${(lastMarginRatio * 100).toFixed(1)}%, reconciled=${reconciled}, halted=${haltedCoins.size}, fails=${failSummary}`));
       }
 
       if (running) await new Promise((r) => setTimeout(r, intervalSec * 1000));
@@ -1405,7 +1597,10 @@ const mirrorCmd = new Command('mirror')
     process.off('SIGINT', shutdown);
     process.off('SIGTERM', shutdown);
     console.log('');
-    info(`Mirror stopped. Total mirrored: ${mirrored}`);
+    const haltTag = haltedCoins.size > 0
+      ? `, halted: ${[...haltedCoins].join(', ')}`
+      : '';
+    info(`Mirror stopped. Reconciled: ${reconciled}${haltTag}`);
   }));
 
 // ─── leverage ────────────────────────────────────────────────────────────

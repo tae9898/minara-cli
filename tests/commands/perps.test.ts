@@ -33,6 +33,7 @@ vi.mock('../../src/api/perps.js', () => ({
   getOpenOrders: vi.fn().mockResolvedValue([]),
   getUserFills: vi.fn().mockResolvedValue([]),
   getUserLeverage: vi.fn().mockResolvedValue([]),
+  getUserPositions: vi.fn().mockResolvedValue([]),
   placeOrders: vi.fn(),
   cancelOrders: vi.fn(),
   deposit: vi.fn(),
@@ -765,5 +766,207 @@ describe('perps leverage command', () => {
     expect(output.join('\n')).toContain('10x');
 
     logSpy.mockRestore();
+  });
+});
+
+// ─── mirror (net-exposure reconciliation) ────────────────────────────────
+
+describe('perps mirror command (reconciliation)', () => {
+  const mockPlaceOrders = vi.mocked(perpsApi.placeOrders);
+  const mockGetUserPositions = vi.mocked(perpsApi.getUserPositions);
+  const mockGetAccountSummary = vi.mocked(perpsApi.getAccountSummary);
+  // External address used as a source (triggers getUserPositions path)
+  const EXT_ADDR = '0x' + 'a'.repeat(40);
+  const ASSETS = [
+    { name: 'BTC', maxLeverage: 50, szDecimals: 5, markPx: 60000 },
+  ];
+
+  // The default wallet (WALLET_DEFAULT, isDefault:true) is resolved with
+  // walletId=undefined, which makes fetchTargetState use getAccountSummary
+  // instead of getSubAccountSummary. Tests that override target state must
+  // therefore set mockGetAccountSummary, not mockGetSubAccountSummary.
+  function setTargetState(assetPositions: { position: { coin: string; szi: string; entryPx?: string } }[], totalMarginUsed = '0', accountValue = '1000') {
+    mockGetAccountSummary.mockResolvedValue({
+      success: true,
+      data: {
+        marginSummary: { accountValue, totalNtlPos: '0', totalMarginUsed },
+        withdrawable: '500',
+        assetPositions,
+      },
+    } as never);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRequireAuth.mockReturnValue({ accessToken: 'test-token' });
+    mockListSubAccounts.mockResolvedValue({ success: true, data: [WALLET_DEFAULT] as never });
+    // Default target: empty, healthy margin
+    setTargetState([]);
+    mockGetAssetMeta.mockResolvedValue(ASSETS);
+    mockGetUserPositions.mockResolvedValue([]);
+    mockPlaceOrders.mockResolvedValue({ success: true, data: { raw_data: [] } });
+    mockUpdateLeverage.mockResolvedValue({ success: true, data: undefined });
+  });
+
+  /**
+   * Run mirror for a bounded number of polls, then exit via SIGINT.
+   * `iterations` controls how many full polls complete before SIGINT fires.
+   *
+   * Commander v12 subcommands accumulate boolean flag values across parseAsync
+   * calls on the same instance, so we manually clear `_optionValues` before
+   * each parse to guarantee a clean option state.
+   */
+  async function runMirror(args: string[], iterations = 1): Promise<string> {
+    let polls = 0;
+    mockGetAssetMeta.mockImplementation(async () => {
+      polls++;
+      if (polls >= iterations) process.emit('SIGINT', 'SIGINT');
+      return ASSETS;
+    });
+
+    const cmd = await getCmd('mirror');
+    // Wipe Commander's cached option values so this test gets fresh defaults.
+    (cmd as unknown as { _optionValues: Record<string, unknown> })._optionValues = {};
+
+    const output: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...a) => output.push(a.join(' ')));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation((...a) => output.push(a.join(' ')));
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await cmd.parseAsync(args, { from: 'user' });
+      return output.join('\n');
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  }
+
+  it('should exit cleanly when user declines confirmation', async () => {
+    mockConfirm.mockResolvedValueOnce(false as never);
+
+    const cmd = await getCmd('mirror');
+    (cmd as unknown as { _optionValues: Record<string, unknown> })._optionValues = {};
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await cmd.parseAsync(['-w', 'Main', '--source', EXT_ADDR], { from: 'user' });
+
+    expect(mockConfirm).toHaveBeenCalled();
+    expect(mockPlaceOrders).not.toHaveBeenCalled();
+
+    logSpy.mockRestore();
+  });
+
+  it('dry-run: should detect source long and propose target short (no orders)', async () => {
+    mockGetUserPositions.mockResolvedValue([
+      { coin: 'BTC', szi: 0.5, entryPx: 60000, unrealizedPnl: 0 },
+    ]);
+
+    const full = await runMirror(
+      ['--dry-run', '-y', '-w', 'Main', '--source', EXT_ADDR, '-i', '3'],
+      1,
+    );
+
+    expect(full).toContain('BTC');
+    expect(full).toContain('mismatch=');
+    expect(full).toContain('DRY RUN');
+    // No leverage set, no orders placed in dry-run
+    expect(mockUpdateLeverage).not.toHaveBeenCalled();
+    expect(mockPlaceOrders).not.toHaveBeenCalled();
+  });
+
+  it('dry-run: should mark REDUCE / reduce-only when closing an existing hedge', async () => {
+    // Target already has BTC short (existing hedge)
+    setTargetState(
+      [{ position: { coin: 'BTC', szi: '-0.5', entryPx: '60000' } }],
+      '200',
+    );
+    // Source has gone flat (closed long)
+    mockGetUserPositions.mockResolvedValue([]);
+
+    const full = await runMirror(
+      ['--dry-run', '-y', '-w', 'Main', '--source', EXT_ADDR, '-i', '3'],
+      1,
+    );
+
+    expect(full).toContain('REDUCE');
+    expect(full).toContain('reduce-only');
+    expect(mockPlaceOrders).not.toHaveBeenCalled();
+  });
+
+  it('should block new orders when target margin ratio exceeds ceiling', async () => {
+    // marginRatio = 900/1000 = 0.9 > default 0.80
+    setTargetState([], '900', '1000');
+    mockGetUserPositions.mockResolvedValue([
+      { coin: 'BTC', szi: 0.5, entryPx: 60000, unrealizedPnl: 0 },
+    ]);
+
+    const full = await runMirror(
+      ['--dry-run', '-y', '-w', 'Main', '--source', EXT_ADDR, '-i', '3', '--margin-ceiling', '0.80'],
+      1,
+    );
+
+    expect(full).toContain('exceeds ceiling');
+    expect(mockPlaceOrders).not.toHaveBeenCalled();
+  });
+
+  it('should flatten + halt a coin after exceeding --max-retries', async () => {
+    // Target has an existing BTC short that needs to be closed (source flat).
+    // Mismatch tries to REDUCE the hedge but every order fails — after
+    // max-retries, the existing target position must be flattened.
+    setTargetState(
+      [{ position: { coin: 'BTC', szi: '-0.5', entryPx: '60000' } }],
+      '200',
+    );
+    mockGetUserPositions.mockResolvedValue([]);
+    // Every order fails
+    mockPlaceOrders.mockResolvedValue({
+      success: false, error: { code: 500, message: 'Test failure' },
+    });
+
+    // max-retries=2: iter1 (fails=0→1), iter2 (fails=1→2), iter3 (2>=2 → flatten+halt)
+    const full = await runMirror(
+      ['-y', '-w', 'Main', '--source', EXT_ADDR, '-i', '3', '--max-retries', '2'],
+      3,
+    );
+
+    expect(full).toContain('exceeded 2 consecutive failures');
+    // 2 REDUCE attempts + 1 flatten attempt = 3 placeOrders calls
+    expect(mockPlaceOrders.mock.calls.length).toBeGreaterThanOrEqual(3);
+    // Final flatten call should be reduce-only
+    const lastCall = mockPlaceOrders.mock.calls.at(-1)?.[1];
+    expect(lastCall.orders[0].r).toBe(true);
+  }, 15000);
+
+  it('baseline-only: should NOT hedge source positions present at startup', async () => {
+    // Source has BTC position that does NOT change
+    mockGetUserPositions.mockResolvedValue([
+      { coin: 'BTC', szi: 0.5, entryPx: 60000, unrealizedPnl: 0 },
+    ]);
+
+    const full = await runMirror(
+      ['--dry-run', '-y', '-w', 'Main', '--source', EXT_ADDR, '-i', '3', '--baseline-only'],
+      1,
+    );
+
+    expect(full).toContain('Baseline set');
+    // No mismatch to reconcile — baseline = current source positions
+    expect(full).not.toMatch(/mismatch=/);
+    expect(mockPlaceOrders).not.toHaveBeenCalled();
+  });
+
+  it('should attach SL trigger on new opens when --stop-loss is set', async () => {
+    mockGetUserPositions.mockResolvedValue([
+      { coin: 'BTC', szi: 0.5, entryPx: 60000, unrealizedPnl: 0 },
+    ]);
+
+    const full = await runMirror(
+      ['--dry-run', '-y', '-w', 'Main', '--source', EXT_ADDR, '-i', '3', '--stop-loss', '5'],
+      1,
+    );
+
+    // Dry-run log should mention the SL attachment on a brand-new open
+    expect(full).toMatch(/SL 5%/);
   });
 });
