@@ -54,6 +54,11 @@ const WALLET_DEFAULT = {
   equityValue: 1000, dispatchableValue: 500, totalUnrealizedPnl: 50, totalMarginUsed: 200,
   positions: [],
 };
+const WALLET_SUB = {
+  _id: 'w-sub', name: 'Sub', address: '0xBBB', isDefault: false,
+  equityValue: 500, dispatchableValue: 300, totalUnrealizedPnl: 0, totalMarginUsed: 0,
+  positions: [],
+};
 
 const ASSETS = [
   { name: 'ETH', markPx: 2000, szDecimals: 4, maxLeverage: 50 },
@@ -272,6 +277,94 @@ describe('perps flash command', () => {
 
     expect(mockPlaceOrders).toHaveBeenCalledTimes(3); // 3 buy attempts, then halt
     expect(output.join('\n')).toContain('3 consecutive buy failures');
+
+    logSpy.mockRestore();
+  });
+
+  it('should open a delta-neutral pair with --hedge (long main + short hedge)', async () => {
+    mockListSubAccounts.mockResolvedValue({ success: true, data: [WALLET_DEFAULT, WALLET_SUB] as never });
+    mockPlaceOrders.mockResolvedValue({ success: true, data: { status: 'ok' } } as never);
+
+    const cmd = await getCmd('flash');
+    const { output, logSpy } = captureOutput();
+
+    await cmd.parseAsync(
+      ['-s', 'ETH', '-w', 'Main', '--hedge', 'Sub', '-u', '100', '-l', '10', '-d', '0', '--repeat', '1', '-y'],
+      { from: 'user' },
+    );
+
+    // Leverage set on both wallets
+    expect(mockUpdateLeverage).toHaveBeenCalledTimes(2);
+
+    // Entry long on main (default wallet → subAccountId undefined)
+    expect(mockPlaceOrders).toHaveBeenNthCalledWith(1, 'test-token', {
+      orders: [{ a: 'ETH', b: true, p: '2020.0', s: '0.0500', r: false, t: { limit: { tif: 'Ioc' } } }],
+      grouping: 'na', subAccountId: undefined,
+    });
+    // Entry short (same size) on hedge wallet
+    expect(mockPlaceOrders).toHaveBeenNthCalledWith(2, 'test-token', {
+      orders: [{ a: 'ETH', b: false, p: '1980.0', s: '0.0500', r: false, t: { limit: { tif: 'Ioc' } } }],
+      grouping: 'na', subAccountId: 'w-sub',
+    });
+    // Exit main: reduce-only sell
+    expect(mockPlaceOrders).toHaveBeenNthCalledWith(3, 'test-token', {
+      orders: [{ a: 'ETH', b: false, p: '1980.0', s: '0.0500', r: true, t: { limit: { tif: 'Ioc' } } }],
+      grouping: 'na', subAccountId: undefined,
+    });
+    // Exit hedge: reduce-only buy-back
+    expect(mockPlaceOrders).toHaveBeenNthCalledWith(4, 'test-token', {
+      orders: [{ a: 'ETH', b: true, p: '2020.0', s: '0.0500', r: true, t: { limit: { tif: 'Ioc' } } }],
+      grouping: 'na', subAccountId: 'w-sub',
+    });
+
+    const full = output.join('\n');
+    expect(full).toContain('Pair open — LONG 0.0500 ETH on Main (default)');
+    expect(full).toContain('SHORT on Sub');
+    expect(full).toContain('Pair closed — flash trade complete');
+
+    logSpy.mockRestore();
+  });
+
+  it('should flatten the main leg when the hedge entry fails', async () => {
+    mockListSubAccounts.mockResolvedValue({ success: true, data: [WALLET_DEFAULT, WALLET_SUB] as never });
+    mockPlaceOrders
+      .mockResolvedValueOnce({ success: true, data: { status: 'ok' } } as never)   // main entry
+      .mockResolvedValueOnce({ success: false, error: { code: 500, message: 'no margin' } } as never) // hedge entry
+      .mockResolvedValueOnce({ success: true, data: { status: 'ok' } } as never);  // emergency flatten
+
+    const cmd = await getCmd('flash');
+    const { output, logSpy } = captureOutput();
+
+    await cmd.parseAsync(
+      ['-s', 'ETH', '-w', 'Main', '--hedge', 'Sub', '-u', '100', '-d', '0', '--repeat', '1', '-y'],
+      { from: 'user' },
+    );
+
+    expect(mockPlaceOrders).toHaveBeenCalledTimes(3);
+    // Emergency flatten: reduce-only sell of the long on the main wallet
+    expect(mockPlaceOrders).toHaveBeenNthCalledWith(3, 'test-token', {
+      orders: [{ a: 'ETH', b: false, p: '1980.0', s: '0.0500', r: true, t: { limit: { tif: 'Ioc' } } }],
+      grouping: 'na', subAccountId: undefined,
+    });
+
+    const full = output.join('\n');
+    expect(full).toContain('Hedge entry failed');
+    expect(full).toContain('flattening main leg');
+    expect(full).toContain('Flattened 0.0500 ETH');
+
+    logSpy.mockRestore();
+  });
+
+  it('should reject --hedge pointing at the same wallet', async () => {
+    mockListSubAccounts.mockResolvedValue({ success: true, data: [WALLET_DEFAULT, WALLET_SUB] as never });
+
+    const cmd = await getCmd('flash');
+    const { output, logSpy } = captureOutput();
+
+    await cmd.parseAsync(['-s', 'ETH', '-w', 'Sub', '--hedge', 'Sub', '-y'], { from: 'user' });
+
+    expect(output.join('\n')).toContain('must differ from the main wallet');
+    expect(mockPlaceOrders).not.toHaveBeenCalled();
 
     logSpy.mockRestore();
   });

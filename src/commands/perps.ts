@@ -1087,6 +1087,7 @@ interface FlashOpts {
   repeat?: string;
   pause?: string;
   side?: string;
+  hedge?: string;
   dryRun?: boolean;
   yes?: boolean;
 }
@@ -1101,6 +1102,7 @@ const flashCmd = new Command('flash')
   .option('--repeat <n>', 'Number of round trips (0 = infinite, Ctrl+C stops after current round)', '0')
   .option('--pause <seconds>', 'Seconds to wait between rounds', '5')
   .option('--side <side>', 'Direction: long (buy first) or short (sell first)', 'long')
+  .option('--hedge <wallet>', 'Hold an equal opposite position on another wallet (delta-neutral pair)')
   .option('--dry-run', 'Simulate without placing real orders')
   .option('-y, --yes', 'Skip confirmation')
   .action(wrapAction(async (opts: FlashOpts) => {
@@ -1122,6 +1124,29 @@ const flashCmd = new Command('flash')
       info('Turn off autopilot first: minara perps autopilot');
       console.log('');
       return;
+    }
+
+    // ── Hedge wallet (delta-neutral pair mode) ───────────────────────────
+    let hedgeWallet: PerpSubAccount | null = null;
+    let hedgeWalletId: string | undefined;
+    if (opts.hedge) {
+      const hedgeResolved = await resolveWallet(creds.accessToken, opts.hedge, 'Select hedge (opposite) wallet:');
+      if (!hedgeResolved) return;
+      hedgeWallet = hedgeResolved.wallet;
+      hedgeWalletId = hedgeResolved.walletId;
+      if (getSubAccountId(hedgeWallet) === getSubAccountId(wallet)) {
+        warn('Hedge wallet must differ from the main wallet — same-wallet long+short nets to flat.');
+        return;
+      }
+      const hedgeStrategy = getAllStrategiesForWallet(allStates, getSubAccountId(hedgeWallet), !!hedgeWallet.isDefault)
+        .find((s) => s.active);
+      if (hedgeStrategy) {
+        console.log('');
+        warn(`Autopilot "${strategyDisplayName(hedgeStrategy)}" is ON for hedge wallet "${hedgeWallet.name ?? 'this wallet'}".`);
+        info('Turn off autopilot first: minara perps autopilot');
+        console.log('');
+        return;
+      }
     }
 
     const usdAmount = parseFloat(opts.usd ?? '1000');
@@ -1178,6 +1203,9 @@ const flashCmd = new Command('flash')
     console.log(chalk.bold('Flash Trade Preview:'));
     console.log(`  Asset      : ${chalk.bold(asset)}`);
     console.log(`  Side       : ${isLong ? chalk.green('LONG') : chalk.red('SHORT')}`);
+    if (hedgeWallet) {
+      console.log(`  Pair       : ${isLong ? chalk.green('LONG') : chalk.red('SHORT')} on ${getSubAccountLabel(wallet)} + ${isLong ? chalk.red('SHORT') : chalk.green('LONG')} on ${getSubAccountLabel(hedgeWallet)} ${chalk.dim('(delta-neutral)')}`);
+    }
     console.log(`  Notional   : ${chalk.bold(fmt(usdAmount))}`);
     console.log(`  Leverage   : ${chalk.cyan(`${targetLeverage}x (cross)`)}  ${chalk.dim(`~${fmt(marginEst)} margin`)}`);
     console.log(`  Entry      : ${formatOrderSide(isLong ? 'buy' : 'sell')} (market ~$${entryPx.toLocaleString()}) → ${chalk.bold(size)} ${asset}`);
@@ -1196,20 +1224,22 @@ const flashCmd = new Command('flash')
     }
 
     if (!opts.yes) {
-      await requireTransactionConfirmation(`Flash ${isLong ? 'LONG' : 'SHORT'} ${asset} · ${fmt(usdAmount)} notional @ ${targetLeverage}x · hold ${delaySec}s${rounds !== 1 ? ` × ${rounds === 0 ? '∞' : rounds}` : ''}`);
+      await requireTransactionConfirmation(`Flash ${isLong ? 'LONG' : 'SHORT'} ${asset} · ${fmt(usdAmount)} notional @ ${targetLeverage}x · hold ${delaySec}s${hedgeWallet ? ` · PAIR + ${hedgeWallet.name ?? 'hedge'}` : ''}${rounds !== 1 ? ` × ${rounds === 0 ? '∞' : rounds}` : ''}`);
     }
     await requireTouchId();
 
-    // Set leverage before entry (once — applies to every round)
-    try {
-      await perpsApi.updateLeverage(creds.accessToken, {
-        symbol: asset,
-        isCross: true,
-        leverage: targetLeverage,
-        subAccountId: walletId,
-      });
-    } catch (e) {
-      warn(`Could not set leverage for ${asset}: ${String(e).slice(0, 80)}`);
+    // Set leverage before entry (once — applies to every round, both wallets in pair mode)
+    for (const subId of hedgeWallet ? [walletId, hedgeWalletId] : [walletId]) {
+      try {
+        await perpsApi.updateLeverage(creds.accessToken, {
+          symbol: asset,
+          isCross: true,
+          leverage: targetLeverage,
+          subAccountId: subId,
+        });
+      } catch (e) {
+        warn(`Could not set leverage for ${asset}: ${String(e).slice(0, 80)}`);
+      }
     }
 
     // ── One round trip: market buy → hold → reduce-only market sell ──────
@@ -1226,6 +1256,136 @@ const flashCmd = new Command('flash')
         return { status: 'buy-failed', estPnl: 0 };
       }
       const roundSize = (usdAmount / roundEntryPx).toFixed(szDecimals);
+
+      // ── Pair mode: equal opposite position on the hedge wallet ──────────
+      if (hedgeWallet) {
+        const emergencyFlatten = async (subId: string | undefined, posIsLong: boolean): Promise<void> => {
+          try {
+            const res = await perpsApi.placeOrders(creds.accessToken, {
+              orders: [{
+                a: asset,
+                b: !posIsLong,
+                p: (roundEntryPx * (posIsLong ? 0.99 : 1.01)).toPrecision(5),
+                s: roundSize,
+                r: true,
+                t: { limit: { tif: 'Ioc' } },
+              }],
+              grouping: 'na',
+              subAccountId: subId,
+            });
+            if (res.success) success(`  Flattened ${roundSize} ${asset} (${posIsLong ? 'LONG' : 'SHORT'}) — exposure cleared`);
+            else warn(`  Flatten failed — close manually: minara perps close -s ${asset}`);
+          } catch {
+            warn(`  Flatten error — close manually: minara perps close -s ${asset}`);
+          }
+        };
+
+        // Entry leg 1: main wallet
+        const mainSpin = spinner(`Opening ${isLong ? 'LONG' : 'SHORT'} ${roundSize} ${asset} on ${getSubAccountLabel(wallet)}…`);
+        let mainRes;
+        try {
+          mainRes = await perpsApi.placeOrders(creds.accessToken, {
+            orders: [{
+              a: asset, b: isLong,
+              p: (roundEntryPx * (isLong ? 1.01 : 0.99)).toPrecision(5),
+              s: roundSize, r: false, t: { limit: { tif: 'Ioc' } },
+            }],
+            grouping: 'na', subAccountId: walletId,
+          });
+        } catch (e) {
+          mainSpin.stop();
+          warn(`Pair entry error: ${String(e).slice(0, 100)}`);
+          return { status: 'buy-failed', estPnl: 0 };
+        }
+        mainSpin.stop();
+        if (!mainRes.success) {
+          warn(`Pair entry failed: ${mainRes.error?.message ?? 'Unknown error'}`);
+          return { status: 'buy-failed', estPnl: 0 };
+        }
+
+        // Entry leg 2: hedge wallet (opposite, same size)
+        const hedgeSpin = spinner(`Opening ${isLong ? 'SHORT' : 'LONG'} ${roundSize} ${asset} on ${getSubAccountLabel(hedgeWallet)}…`);
+        let hedgeRes;
+        try {
+          hedgeRes = await perpsApi.placeOrders(creds.accessToken, {
+            orders: [{
+              a: asset, b: !isLong,
+              p: (roundEntryPx * (isLong ? 0.99 : 1.01)).toPrecision(5),
+              s: roundSize, r: false, t: { limit: { tif: 'Ioc' } },
+            }],
+            grouping: 'na', subAccountId: hedgeWalletId,
+          });
+        } catch (e) {
+          hedgeSpin.stop();
+          warn(`Hedge entry error: ${String(e).slice(0, 100)} — flattening main leg…`);
+          await emergencyFlatten(walletId, isLong);
+          return { status: 'buy-failed', estPnl: 0 };
+        }
+        hedgeSpin.stop();
+        if (!hedgeRes.success) {
+          warn(`Hedge entry failed: ${hedgeRes.error?.message ?? 'Unknown error'} — flattening main leg…`);
+          await emergencyFlatten(walletId, isLong);
+          return { status: 'buy-failed', estPnl: 0 };
+        }
+        success(`Pair open — ${isLong ? 'LONG' : 'SHORT'} ${roundSize} ${asset} on ${getSubAccountLabel(wallet)} + ${isLong ? 'SHORT' : 'LONG'} on ${getSubAccountLabel(hedgeWallet)} (~${fmt(usdAmount)} each)`);
+
+        // Hold
+        if (delaySec > 0) {
+          const holdSpin = spinner(`Holding pair for ${delaySec}s…`);
+          await new Promise((r) => setTimeout(r, delaySec * 1000));
+          holdSpin.stop();
+        }
+
+        // Exit both legs (reduce-only)
+        const exitMeta = (await perpsApi.getAssetMeta(true)).find((a) => a.name.toUpperCase() === asset);
+        const pairExitPx = exitMeta?.markPx ?? roundEntryPx;
+        const exitFailures: string[] = [];
+
+        const mainExitSpin = spinner(`Closing ${isLong ? 'LONG' : 'SHORT'} on ${getSubAccountLabel(wallet)}…`);
+        try {
+          const r = await perpsApi.placeOrders(creds.accessToken, {
+            orders: [{
+              a: asset, b: !isLong,
+              p: (pairExitPx * (isLong ? 0.99 : 1.01)).toPrecision(5),
+              s: roundSize, r: true, t: { limit: { tif: 'Ioc' } },
+            }],
+            grouping: 'na', subAccountId: walletId,
+          });
+          mainExitSpin.stop();
+          if (!r.success) exitFailures.push(wallet.name ?? 'main wallet');
+        } catch {
+          mainExitSpin.stop();
+          exitFailures.push(wallet.name ?? 'main wallet');
+        }
+
+        const hedgeExitSpin = spinner(`Closing ${isLong ? 'SHORT' : 'LONG'} on ${getSubAccountLabel(hedgeWallet)}…`);
+        try {
+          const r = await perpsApi.placeOrders(creds.accessToken, {
+            orders: [{
+              a: asset, b: isLong,
+              p: (pairExitPx * (isLong ? 1.01 : 0.99)).toPrecision(5),
+              s: roundSize, r: true, t: { limit: { tif: 'Ioc' } },
+            }],
+            grouping: 'na', subAccountId: hedgeWalletId,
+          });
+          hedgeExitSpin.stop();
+          if (!r.success) exitFailures.push(hedgeWallet.name ?? 'hedge wallet');
+        } catch {
+          hedgeExitSpin.stop();
+          exitFailures.push(hedgeWallet.name ?? 'hedge wallet');
+        }
+
+        if (exitFailures.length > 0) {
+          warn(`Exit failed on: ${exitFailures.join(', ')} — directional exposure! Close manually with: minara perps close -s ${asset}`);
+          return { status: 'sell-failed', estPnl: 0 };
+        }
+
+        success(`Pair closed — flash trade complete`);
+        if (rounds !== 1) {
+          console.log(chalk.dim('  ≈ round PnL ±$0.00 (delta-neutral — fees not included)'));
+        }
+        return { status: 'ok', estPnl: 0 };
+      }
 
       // Leg 1: market entry (IOC with 1% slippage)
       const entryOrder: PerpsOrder = {
