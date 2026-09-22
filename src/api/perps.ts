@@ -207,8 +207,8 @@ export interface HlAssetInfo extends HlAssetMeta {
 let _assetInfoCache: HlAssetInfo[] | null = null;
 
 /** Fetch perpetuals universe metadata + live prices from Hyperliquid (cached per session). */
-export async function getAssetMeta(): Promise<HlAssetInfo[]> {
-  if (_assetInfoCache) return _assetInfoCache;
+export async function getAssetMeta(force = false): Promise<HlAssetInfo[]> {
+  if (!force && _assetInfoCache) return _assetInfoCache;
   try {
     const res = await fetch('https://api.hyperliquid.xyz/info', {
       method: 'POST',

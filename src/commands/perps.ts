@@ -1076,6 +1076,278 @@ const closeCmd = new Command('close')
     printTxResult(orderRes.data);
   }));
 
+// ─── flash (round-trip trade) ────────────────────────────────────────────
+
+interface FlashOpts {
+  wallet?: string;
+  symbol?: string;
+  usd?: string;
+  leverage?: string;
+  delay?: string;
+  repeat?: string;
+  pause?: string;
+  dryRun?: boolean;
+  yes?: boolean;
+}
+
+const flashCmd = new Command('flash')
+  .description('Flash trade: market buy $<usd> notional, hold for a delay, then market sell (--repeat to loop)')
+  .option(WALLET_OPT[0], WALLET_OPT[1])
+  .option('-s, --symbol <symbol>', 'Asset symbol (e.g. BTC, ETH)')
+  .option('-u, --usd <amount>', 'Position notional in USD', '100')
+  .option('-l, --leverage <n>', 'Leverage (cross)', '10')
+  .option('-d, --delay <seconds>', 'Seconds to hold before selling', '10')
+  .option('--repeat <n>', 'Number of round trips (0 = infinite, Ctrl+C stops after current round)', '1')
+  .option('--pause <seconds>', 'Seconds to wait between rounds', '0')
+  .option('--dry-run', 'Simulate without placing real orders')
+  .option('-y, --yes', 'Skip confirmation')
+  .action(wrapAction(async (opts: FlashOpts) => {
+    const creds = requireAuth();
+
+    const resolved = await resolveWallet(creds.accessToken, opts.wallet, 'Flash trade on which wallet?');
+    if (!resolved) return;
+    const { wallet, walletId } = resolved;
+
+    // Block while autopilot is trading this wallet (same policy as `order`)
+    const apSpin = spinner('Checking autopilot…');
+    const allStates = await getAllAutopilotStates(creds.accessToken);
+    apSpin.stop();
+    const activeStrategy = getAllStrategiesForWallet(allStates, getSubAccountId(wallet), !!wallet.isDefault)
+      .find((s) => s.active);
+    if (activeStrategy) {
+      console.log('');
+      warn(`Autopilot "${strategyDisplayName(activeStrategy)}" is ON for "${wallet.name ?? 'this wallet'}". Manual order placement is disabled while AI is trading.`);
+      info('Turn off autopilot first: minara perps autopilot');
+      console.log('');
+      return;
+    }
+
+    const usdAmount = parseFloat(opts.usd ?? '100');
+    if (!(usdAmount > 0)) {
+      console.error(chalk.red('✖'), `Invalid --usd amount: ${opts.usd}`);
+      process.exit(1);
+    }
+    const targetLeverage = Math.max(1, parseInt(opts.leverage ?? '10', 10) || 10);
+    const delaySec = Math.max(0, parseInt(opts.delay ?? '10', 10) || 0);
+    const parsedRounds = parseInt(opts.repeat ?? '1', 10);
+    const rounds = Number.isFinite(parsedRounds) && parsedRounds >= 0 ? parsedRounds : 1;
+    const pauseSec = Math.max(0, parseInt(opts.pause ?? '0', 10) || 0);
+
+    // ── Asset ────────────────────────────────────────────────────────────
+    const dataSpin = spinner('Fetching market data…');
+    const assets = await perpsApi.getAssetMeta();
+    dataSpin.stop();
+
+    let asset: string;
+    if (opts.symbol) {
+      asset = opts.symbol.toUpperCase();
+      if (!assets.some((a) => a.name.toUpperCase() === asset)) {
+        console.error(chalk.red('✖'), `Invalid symbol: ${opts.symbol}. Supported: ${assets.map((a) => a.name).join(', ')}`);
+        process.exit(1);
+      }
+    } else {
+      asset = await select({
+        message: 'Asset:',
+        choices: assets.map((a) => ({
+          name: `${a.name.padEnd(6)} ${chalk.dim(a.markPx > 0 ? `$${a.markPx.toLocaleString()}`.padStart(12) : '')}  ${chalk.dim(`max ${a.maxLeverage}x`)}`,
+          value: a.name,
+        })),
+      });
+    }
+
+    const assetMeta = assets.find((a) => a.name.toUpperCase() === asset)!;
+    const entryPx = assetMeta.markPx;
+    if (!entryPx || entryPx <= 0) {
+      warn(`Could not fetch current price for ${asset}.`);
+      return;
+    }
+    const szDecimals = assetMeta.szDecimals ?? 4;
+    const size = (usdAmount / entryPx).toFixed(szDecimals);
+    const marginEst = usdAmount / targetLeverage;
+
+    // ── Preview ──────────────────────────────────────────────────────────
+    console.log('');
+    console.log(chalk.bold('Flash Trade Preview:'));
+    console.log(`  Asset      : ${chalk.bold(asset)}`);
+    console.log(`  Notional   : ${chalk.bold(fmt(usdAmount))}`);
+    console.log(`  Leverage   : ${chalk.cyan(`${targetLeverage}x (cross)`)}  ${chalk.dim(`~${fmt(marginEst)} margin`)}`);
+    console.log(`  Entry      : ${formatOrderSide('buy')} (market ~$${entryPx.toLocaleString()}) → ${chalk.bold(size)} ${asset}`);
+    console.log(`  Hold       : ${chalk.bold(`${delaySec}s`)}`);
+    console.log(`  Exit       : ${formatOrderSide('sell')} (market, reduce-only)`);
+    if (rounds !== 1) {
+      console.log(`  Repeat     : ${rounds === 0 ? chalk.yellow('∞ (Ctrl+C to stop)') : chalk.bold(`${rounds} rounds`)}`);
+      if (pauseSec > 0) console.log(`  Pause      : ${chalk.bold(`${pauseSec}s between rounds`)}`);
+    }
+    console.log(`  Mode       : ${opts.dryRun ? chalk.yellow('DRY RUN') : chalk.red('LIVE')}`);
+    console.log('');
+
+    if (opts.dryRun) {
+      info(`[DRY RUN] Would market buy, hold ${delaySec}s, then market sell${rounds !== 1 ? ` × ${rounds === 0 ? '∞' : rounds}` : ''}. No orders placed.`);
+      return;
+    }
+
+    if (!opts.yes) {
+      await requireTransactionConfirmation(`Flash ${asset} · ${fmt(usdAmount)} notional @ ${targetLeverage}x · hold ${delaySec}s${rounds !== 1 ? ` × ${rounds === 0 ? '∞' : rounds}` : ''}`);
+    }
+    await requireTouchId();
+
+    // Set leverage before entry (once — applies to every round)
+    try {
+      await perpsApi.updateLeverage(creds.accessToken, {
+        symbol: asset,
+        isCross: true,
+        leverage: targetLeverage,
+        subAccountId: walletId,
+      });
+    } catch (e) {
+      warn(`Could not set leverage for ${asset}: ${String(e).slice(0, 80)}`);
+    }
+
+    // ── One round trip: market buy → hold → reduce-only market sell ──────
+    const executeRound = async (roundNo: number): Promise<{ status: 'ok' | 'buy-failed' | 'sell-failed'; estPnl: number }> => {
+      if (rounds !== 1) {
+        console.log(`\n${chalk.bold(`── Round ${roundNo}${rounds === 0 ? '' : `/${rounds}`} ──`)}`);
+      }
+
+      // Fresh entry price → keep notional ≈ --usd every round
+      const entryMeta = (await perpsApi.getAssetMeta(true)).find((a) => a.name.toUpperCase() === asset);
+      const roundEntryPx = entryMeta?.markPx ?? entryPx;
+      if (!(roundEntryPx > 0)) {
+        warn(`Could not fetch current price for ${asset}.`);
+        return { status: 'buy-failed', estPnl: 0 };
+      }
+      const roundSize = (usdAmount / roundEntryPx).toFixed(szDecimals);
+
+      // Leg 1: market buy (IOC with 1% slippage)
+      const buyOrder: PerpsOrder = {
+        a: asset,
+        b: true,
+        p: (roundEntryPx * 1.01).toPrecision(5),
+        s: roundSize,
+        r: false,
+        t: { limit: { tif: 'Ioc' } },
+      };
+
+      let buyRes;
+      const buySpin = spinner(`Buying ${roundSize} ${asset} @ market…`);
+      try {
+        buyRes = await perpsApi.placeOrders(creds.accessToken, {
+          orders: [buyOrder],
+          grouping: 'na',
+          subAccountId: walletId,
+        });
+      } catch (e) {
+        buySpin.stop();
+        warn(`Buy error: ${String(e).slice(0, 100)}`);
+        return { status: 'buy-failed', estPnl: 0 };
+      }
+      buySpin.stop();
+      if (!buyRes.success) {
+        warn(`Buy failed: ${buyRes.error?.message ?? 'Unknown error'}`);
+        return { status: 'buy-failed', estPnl: 0 };
+      }
+      success(`Bought ${roundSize} ${asset} (~${fmt(usdAmount)}) on ${getSubAccountLabel(wallet)}`);
+
+      // Hold
+      if (delaySec > 0) {
+        const holdSpin = spinner(`Holding ${asset} for ${delaySec}s…`);
+        await new Promise((r) => setTimeout(r, delaySec * 1000));
+        holdSpin.stop();
+      }
+
+      // Leg 2: market sell (reduce-only IOC with 1% slippage)
+      const exitMeta = (await perpsApi.getAssetMeta(true)).find((a) => a.name.toUpperCase() === asset);
+      const exitPx = exitMeta?.markPx ?? roundEntryPx;
+      const sellOrder: PerpsOrder = {
+        a: asset,
+        b: false,
+        p: (exitPx * 0.99).toPrecision(5),
+        s: roundSize,
+        r: true,
+        t: { limit: { tif: 'Ioc' } },
+      };
+
+      let sellRes;
+      const sellSpin = spinner(`Selling ${roundSize} ${asset} @ market…`);
+      try {
+        sellRes = await perpsApi.placeOrders(creds.accessToken, {
+          orders: [sellOrder],
+          grouping: 'na',
+          subAccountId: walletId,
+        });
+      } catch (e) {
+        sellSpin.stop();
+        warn(`Sell error: ${String(e).slice(0, 100)}`);
+        warn(`Position still open: ${roundSize} ${asset} LONG — close manually with: minara perps close -s ${asset}`);
+        return { status: 'sell-failed', estPnl: 0 };
+      }
+      sellSpin.stop();
+
+      if (!sellRes.success) {
+        warn(`Sell failed: ${sellRes.error?.message ?? 'Unknown error'}`);
+        warn(`Position still open: ${roundSize} ${asset} LONG — close manually with: minara perps close -s ${asset}`);
+        return { status: 'sell-failed', estPnl: 0 };
+      }
+
+      success(`Sold ${roundSize} ${asset} — flash trade complete`);
+      const estPnl = (exitPx - roundEntryPx) * parseFloat(roundSize);
+      if (rounds !== 1) {
+        console.log(chalk.dim(`  ≈ round PnL ${pnlFmt(estPnl)} (mark-based estimate)`));
+      } else {
+        printTxResult(sellRes.data);
+      }
+      return { status: 'ok', estPnl };
+    };
+
+    // ── Round loop (Ctrl+C = finish current round, start no new ones) ────
+    let running = true;
+    const stopForSigint = () => {
+      running = false;
+      info('Stop requested — finishing the current round, no new rounds will start…');
+    };
+    process.on('SIGINT', stopForSigint);
+
+    let completed = 0;
+    let buyFailStreak = 0;
+    let estTotal = 0;
+    let stopReason = '';
+    let roundNo = 0;
+
+    while (running) {
+      roundNo++;
+      if (rounds > 0 && roundNo > rounds) break;
+
+      const { status, estPnl } = await executeRound(roundNo);
+      if (status === 'ok') {
+        completed++;
+        buyFailStreak = 0;
+        estTotal += estPnl;
+      } else if (status === 'buy-failed') {
+        buyFailStreak++;
+        if (buyFailStreak >= 3) {
+          stopReason = '3 consecutive buy failures';
+          break;
+        }
+      } else {
+        stopReason = 'sell failure — position may still be open';
+        break;
+      }
+
+      if (running && (rounds === 0 || roundNo < rounds) && pauseSec > 0) {
+        const pauseSpin = spinner(`Waiting ${pauseSec}s before next round…`);
+        await new Promise((r) => setTimeout(r, pauseSec * 1000));
+        pauseSpin.stop();
+      }
+    }
+
+    process.off('SIGINT', stopForSigint);
+
+    console.log('');
+    const failNote = buyFailStreak > 0 ? `, ${buyFailStreak} buy failure(s)` : '';
+    const pnlNote = rounds !== 1 ? ` · ≈ ${pnlFmt(estTotal)} cumulative (estimate)` : '';
+    info(`Flash stopped after ${completed} completed round(s)${failNote}${stopReason ? ` — ${stopReason}` : ''}${pnlNote}`);
+  }));
+
 // ─── leverage ────────────────────────────────────────────────────────────
 
 interface LeverageOpts {
@@ -2322,6 +2594,7 @@ export const perpsCommand = new Command('perps')
   .addCommand(orderCmd)
   .addCommand(cancelCmd)
   .addCommand(closeCmd)
+  .addCommand(flashCmd)
   .addCommand(leverageCmd)
   .addCommand(tradesCmd)
   .addCommand(depositCmd)
@@ -2347,6 +2620,7 @@ export const perpsCommand = new Command('perps')
         { name: 'View positions', value: 'positions' },
         { name: 'Place order', value: 'order' },
         { name: 'Close position', value: 'close' },
+        { name: 'Flash trade (buy → hold → sell)', value: 'flash' },
         { name: 'Cancel order', value: 'cancel' },
         { name: 'Update leverage', value: 'leverage' },
         { name: 'View trade history', value: 'trades' },
