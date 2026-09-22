@@ -94,7 +94,7 @@ describe('perps flash command', () => {
     const cmd = await getCmd('flash');
     const { output, logSpy } = captureOutput();
 
-    await cmd.parseAsync(['-s', 'ETH', '-u', '100', '-l', '10', '-d', '0', '-y'], { from: 'user' });
+    await cmd.parseAsync(['-s', 'ETH', '-u', '100', '-l', '10', '-d', '0', '--repeat', '1', '-y'], { from: 'user' });
 
     // Leverage set before entry
     expect(mockUpdateLeverage).toHaveBeenCalledWith('test-token', {
@@ -126,6 +126,42 @@ describe('perps flash command', () => {
     logSpy.mockRestore();
   });
 
+  it('should support short side: sell entry, reduce-only buy-back exit', async () => {
+    mockPlaceOrders
+      .mockResolvedValueOnce({ success: true, data: { status: 'ok' } } as never)
+      .mockResolvedValueOnce({ success: true, data: { status: 'ok' } } as never);
+
+    const cmd = await getCmd('flash');
+    const { output, logSpy } = captureOutput();
+
+    await cmd.parseAsync(['-s', 'ETH', '-u', '100', '-l', '10', '-d', '0', '--side', 'short', '--repeat', '1', '-y'], { from: 'user' });
+
+    // Leg 1: sell entry (not reduce-only), 1% slippage below mark
+    expect(mockPlaceOrders).toHaveBeenNthCalledWith(1, 'test-token', {
+      orders: [{
+        a: 'ETH', b: false, p: '1980.0', s: '0.0500', r: false, t: { limit: { tif: 'Ioc' } },
+      }],
+      grouping: 'na',
+      subAccountId: undefined,
+    });
+
+    // Leg 2: reduce-only buy-back, 1% slippage above mark
+    expect(mockPlaceOrders).toHaveBeenNthCalledWith(2, 'test-token', {
+      orders: [{
+        a: 'ETH', b: true, p: '2020.0', s: '0.0500', r: true, t: { limit: { tif: 'Ioc' } },
+      }],
+      grouping: 'na',
+      subAccountId: undefined,
+    });
+
+    const full = output.join('\n');
+    expect(full).toContain('SHORT');
+    expect(full).toContain('Sold (short) 0.0500 ETH');
+    expect(full).toContain('Bought back 0.0500 ETH');
+
+    logSpy.mockRestore();
+  });
+
   it('should not place orders in dry-run mode', async () => {
     const cmd = await getCmd('flash');
     const { output, logSpy } = captureOutput();
@@ -152,7 +188,7 @@ describe('perps flash command', () => {
     await cmd.parseAsync(['-s', 'ETH', '-d', '0', '-y'], { from: 'user' });
 
     const full = output.join('\n');
-    expect(full).toContain('Sell failed');
+    expect(full).toContain('Exit failed');
     expect(full).toContain('insufficient liquidity');
     expect(full).toContain('minara perps close -s ETH');
 
@@ -183,7 +219,7 @@ describe('perps flash command', () => {
     const cmd = await getCmd('flash');
     const { output, logSpy } = captureOutput();
 
-    await cmd.parseAsync(['-s', 'ETH', '-d', '0', '--repeat', '2', '-y'], { from: 'user' });
+    await cmd.parseAsync(['-s', 'ETH', '-d', '0', '--repeat', '2', '--pause', '0', '-y'], { from: 'user' });
 
     // 2 rounds × (buy + sell)
     expect(mockPlaceOrders).toHaveBeenCalledTimes(4);
@@ -217,7 +253,7 @@ describe('perps flash command', () => {
 
     expect(mockPlaceOrders).toHaveBeenCalledTimes(2); // no further rounds started
     const full = output.join('\n');
-    expect(full).toContain('Sell failed');
+    expect(full).toContain('Exit failed');
     expect(full).toContain('minara perps close -s ETH');
     expect(full).toContain('sell failure');
 
@@ -232,7 +268,7 @@ describe('perps flash command', () => {
     const cmd = await getCmd('flash');
     const { output, logSpy } = captureOutput();
 
-    await cmd.parseAsync(['-s', 'ETH', '-d', '0', '--repeat', '0', '-y'], { from: 'user' });
+    await cmd.parseAsync(['-s', 'ETH', '-d', '0', '--repeat', '0', '--pause', '0', '-y'], { from: 'user' });
 
     expect(mockPlaceOrders).toHaveBeenCalledTimes(3); // 3 buy attempts, then halt
     expect(output.join('\n')).toContain('3 consecutive buy failures');

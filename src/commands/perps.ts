@@ -1086,19 +1086,21 @@ interface FlashOpts {
   delay?: string;
   repeat?: string;
   pause?: string;
+  side?: string;
   dryRun?: boolean;
   yes?: boolean;
 }
 
 const flashCmd = new Command('flash')
-  .description('Flash trade: market buy $<usd> notional, hold for a delay, then market sell (--repeat to loop)')
+  .description('Flash trade: market entry $<usd> notional, hold for a delay, then reduce-only market exit (--repeat loops)')
   .option(WALLET_OPT[0], WALLET_OPT[1])
   .option('-s, --symbol <symbol>', 'Asset symbol (e.g. BTC, ETH)')
-  .option('-u, --usd <amount>', 'Position notional in USD', '100')
-  .option('-l, --leverage <n>', 'Leverage (cross)', '10')
-  .option('-d, --delay <seconds>', 'Seconds to hold before selling', '10')
-  .option('--repeat <n>', 'Number of round trips (0 = infinite, Ctrl+C stops after current round)', '1')
-  .option('--pause <seconds>', 'Seconds to wait between rounds', '0')
+  .option('-u, --usd <amount>', 'Position notional in USD', '1000')
+  .option('-l, --leverage <n>', 'Leverage (cross)', '50')
+  .option('-d, --delay <seconds>', 'Seconds to hold before exiting', '10')
+  .option('--repeat <n>', 'Number of round trips (0 = infinite, Ctrl+C stops after current round)', '0')
+  .option('--pause <seconds>', 'Seconds to wait between rounds', '5')
+  .option('--side <side>', 'Direction: long (buy first) or short (sell first)', 'long')
   .option('--dry-run', 'Simulate without placing real orders')
   .option('-y, --yes', 'Skip confirmation')
   .action(wrapAction(async (opts: FlashOpts) => {
@@ -1122,12 +1124,18 @@ const flashCmd = new Command('flash')
       return;
     }
 
-    const usdAmount = parseFloat(opts.usd ?? '100');
+    const usdAmount = parseFloat(opts.usd ?? '1000');
     if (!(usdAmount > 0)) {
       console.error(chalk.red('✖'), `Invalid --usd amount: ${opts.usd}`);
       process.exit(1);
     }
-    const targetLeverage = Math.max(1, parseInt(opts.leverage ?? '10', 10) || 10);
+    const sideLower = (opts.side ?? 'long').toLowerCase();
+    if (sideLower !== 'long' && sideLower !== 'short') {
+      console.error(chalk.red('✖'), `Invalid side: ${opts.side}. Use 'long' or 'short'.`);
+      process.exit(1);
+    }
+    const isLong = sideLower === 'long';
+    const targetLeverage = Math.max(1, parseInt(opts.leverage ?? '50', 10) || 50);
     const delaySec = Math.max(0, parseInt(opts.delay ?? '10', 10) || 0);
     const parsedRounds = parseInt(opts.repeat ?? '1', 10);
     const rounds = Number.isFinite(parsedRounds) && parsedRounds >= 0 ? parsedRounds : 1;
@@ -1169,11 +1177,12 @@ const flashCmd = new Command('flash')
     console.log('');
     console.log(chalk.bold('Flash Trade Preview:'));
     console.log(`  Asset      : ${chalk.bold(asset)}`);
+    console.log(`  Side       : ${isLong ? chalk.green('LONG') : chalk.red('SHORT')}`);
     console.log(`  Notional   : ${chalk.bold(fmt(usdAmount))}`);
     console.log(`  Leverage   : ${chalk.cyan(`${targetLeverage}x (cross)`)}  ${chalk.dim(`~${fmt(marginEst)} margin`)}`);
-    console.log(`  Entry      : ${formatOrderSide('buy')} (market ~$${entryPx.toLocaleString()}) → ${chalk.bold(size)} ${asset}`);
+    console.log(`  Entry      : ${formatOrderSide(isLong ? 'buy' : 'sell')} (market ~$${entryPx.toLocaleString()}) → ${chalk.bold(size)} ${asset}`);
     console.log(`  Hold       : ${chalk.bold(`${delaySec}s`)}`);
-    console.log(`  Exit       : ${formatOrderSide('sell')} (market, reduce-only)`);
+    console.log(`  Exit       : ${formatOrderSide(isLong ? 'sell' : 'buy')} (market, reduce-only)`);
     if (rounds !== 1) {
       console.log(`  Repeat     : ${rounds === 0 ? chalk.yellow('∞ (Ctrl+C to stop)') : chalk.bold(`${rounds} rounds`)}`);
       if (pauseSec > 0) console.log(`  Pause      : ${chalk.bold(`${pauseSec}s between rounds`)}`);
@@ -1182,12 +1191,12 @@ const flashCmd = new Command('flash')
     console.log('');
 
     if (opts.dryRun) {
-      info(`[DRY RUN] Would market buy, hold ${delaySec}s, then market sell${rounds !== 1 ? ` × ${rounds === 0 ? '∞' : rounds}` : ''}. No orders placed.`);
+      info(`[DRY RUN] Would market ${isLong ? 'buy' : 'sell (short)'}, hold ${delaySec}s, then ${isLong ? 'sell' : 'buy back'}${rounds !== 1 ? ` × ${rounds === 0 ? '∞' : rounds}` : ''}. No orders placed.`);
       return;
     }
 
     if (!opts.yes) {
-      await requireTransactionConfirmation(`Flash ${asset} · ${fmt(usdAmount)} notional @ ${targetLeverage}x · hold ${delaySec}s${rounds !== 1 ? ` × ${rounds === 0 ? '∞' : rounds}` : ''}`);
+      await requireTransactionConfirmation(`Flash ${isLong ? 'LONG' : 'SHORT'} ${asset} · ${fmt(usdAmount)} notional @ ${targetLeverage}x · hold ${delaySec}s${rounds !== 1 ? ` × ${rounds === 0 ? '∞' : rounds}` : ''}`);
     }
     await requireTouchId();
 
@@ -1218,35 +1227,35 @@ const flashCmd = new Command('flash')
       }
       const roundSize = (usdAmount / roundEntryPx).toFixed(szDecimals);
 
-      // Leg 1: market buy (IOC with 1% slippage)
-      const buyOrder: PerpsOrder = {
+      // Leg 1: market entry (IOC with 1% slippage)
+      const entryOrder: PerpsOrder = {
         a: asset,
-        b: true,
-        p: (roundEntryPx * 1.01).toPrecision(5),
+        b: isLong,
+        p: (roundEntryPx * (isLong ? 1.01 : 0.99)).toPrecision(5),
         s: roundSize,
         r: false,
         t: { limit: { tif: 'Ioc' } },
       };
 
-      let buyRes;
-      const buySpin = spinner(`Buying ${roundSize} ${asset} @ market…`);
+      let entryRes;
+      const entrySpin = spinner(`${isLong ? 'Buying' : 'Selling (short)'} ${roundSize} ${asset} @ market…`);
       try {
-        buyRes = await perpsApi.placeOrders(creds.accessToken, {
-          orders: [buyOrder],
+        entryRes = await perpsApi.placeOrders(creds.accessToken, {
+          orders: [entryOrder],
           grouping: 'na',
           subAccountId: walletId,
         });
       } catch (e) {
-        buySpin.stop();
-        warn(`Buy error: ${String(e).slice(0, 100)}`);
+        entrySpin.stop();
+        warn(`Entry error: ${String(e).slice(0, 100)}`);
         return { status: 'buy-failed', estPnl: 0 };
       }
-      buySpin.stop();
-      if (!buyRes.success) {
-        warn(`Buy failed: ${buyRes.error?.message ?? 'Unknown error'}`);
+      entrySpin.stop();
+      if (!entryRes.success) {
+        warn(`Entry failed: ${entryRes.error?.message ?? 'Unknown error'}`);
         return { status: 'buy-failed', estPnl: 0 };
       }
-      success(`Bought ${roundSize} ${asset} (~${fmt(usdAmount)}) on ${getSubAccountLabel(wallet)}`);
+      success(`${isLong ? 'Bought' : 'Sold (short)'} ${roundSize} ${asset} (~${fmt(usdAmount)}) on ${getSubAccountLabel(wallet)}`);
 
       // Hold
       if (delaySec > 0) {
@@ -1255,46 +1264,46 @@ const flashCmd = new Command('flash')
         holdSpin.stop();
       }
 
-      // Leg 2: market sell (reduce-only IOC with 1% slippage)
+      // Leg 2: market exit (reduce-only IOC with 1% slippage)
       const exitMeta = (await perpsApi.getAssetMeta(true)).find((a) => a.name.toUpperCase() === asset);
       const exitPx = exitMeta?.markPx ?? roundEntryPx;
-      const sellOrder: PerpsOrder = {
+      const exitOrder: PerpsOrder = {
         a: asset,
-        b: false,
-        p: (exitPx * 0.99).toPrecision(5),
+        b: !isLong,
+        p: (exitPx * (isLong ? 0.99 : 1.01)).toPrecision(5),
         s: roundSize,
         r: true,
         t: { limit: { tif: 'Ioc' } },
       };
 
-      let sellRes;
-      const sellSpin = spinner(`Selling ${roundSize} ${asset} @ market…`);
+      let exitRes;
+      const exitSpin = spinner(`${isLong ? 'Selling' : 'Buying back'} ${roundSize} ${asset} @ market…`);
       try {
-        sellRes = await perpsApi.placeOrders(creds.accessToken, {
-          orders: [sellOrder],
+        exitRes = await perpsApi.placeOrders(creds.accessToken, {
+          orders: [exitOrder],
           grouping: 'na',
           subAccountId: walletId,
         });
       } catch (e) {
-        sellSpin.stop();
-        warn(`Sell error: ${String(e).slice(0, 100)}`);
-        warn(`Position still open: ${roundSize} ${asset} LONG — close manually with: minara perps close -s ${asset}`);
+        exitSpin.stop();
+        warn(`Exit error: ${String(e).slice(0, 100)}`);
+        warn(`Position still open: ${roundSize} ${asset} ${isLong ? 'LONG' : 'SHORT'} — close manually with: minara perps close -s ${asset}`);
         return { status: 'sell-failed', estPnl: 0 };
       }
-      sellSpin.stop();
+      exitSpin.stop();
 
-      if (!sellRes.success) {
-        warn(`Sell failed: ${sellRes.error?.message ?? 'Unknown error'}`);
-        warn(`Position still open: ${roundSize} ${asset} LONG — close manually with: minara perps close -s ${asset}`);
+      if (!exitRes.success) {
+        warn(`Exit failed: ${exitRes.error?.message ?? 'Unknown error'}`);
+        warn(`Position still open: ${roundSize} ${asset} ${isLong ? 'LONG' : 'SHORT'} — close manually with: minara perps close -s ${asset}`);
         return { status: 'sell-failed', estPnl: 0 };
       }
 
-      success(`Sold ${roundSize} ${asset} — flash trade complete`);
-      const estPnl = (exitPx - roundEntryPx) * parseFloat(roundSize);
+      success(`${isLong ? 'Sold' : 'Bought back'} ${roundSize} ${asset} — flash trade complete`);
+      const estPnl = (isLong ? exitPx - roundEntryPx : roundEntryPx - exitPx) * parseFloat(roundSize);
       if (rounds !== 1) {
         console.log(chalk.dim(`  ≈ round PnL ${pnlFmt(estPnl)} (mark-based estimate)`));
       } else {
-        printTxResult(sellRes.data);
+        printTxResult(exitRes.data);
       }
       return { status: 'ok', estPnl };
     };
